@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+dist/
+*.egg-info/
+.llm-cc/worktrees/
+.llm-cc/logs/
+.llm-cc/tasks.json
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/

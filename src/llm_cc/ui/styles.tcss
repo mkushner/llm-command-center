@@ -1,0 +1,202 @@
+/* LLM Command Center — Dark theme */
+
+$bg: #0d1117;
+$surface: #161b22;
+$surface-hl: #1c2333;
+$border: #30363d;
+$border-hl: #58a6ff;
+$text: #c9d1d9;
+$text-dim: #8b949e;
+$accent: #58a6ff;
+$danger: #f85149;
+$success: #3fb950;
+$warning: #d29922;
+
+Screen {
+    background: $bg;
+}
+
+/* --- Board Screen --- */
+
+#board-header {
+    dock: top;
+    height: 3;
+    background: $surface;
+    color: $text;
+    text-align: center;
+    padding: 1;
+    text-style: bold;
+}
+
+#kanban-board {
+    height: 1fr;
+}
+
+KanbanColumn {
+    width: 1fr;
+    height: 100%;
+    border: solid $border;
+    padding: 0 1;
+}
+
+KanbanColumn.-active {
+    border: solid $border-hl;
+}
+
+.column-header {
+    text-align: center;
+    text-style: bold;
+    color: $text-dim;
+    padding: 1 0;
+    height: 3;
+}
+
+KanbanColumn.-active .column-header {
+    color: $accent;
+    text-style: bold underline;
+}
+
+.column-count {
+    text-align: center;
+    color: $text-dim;
+    height: 1;
+}
+
+TaskCard {
+    height: auto;
+    min-height: 3;
+    max-height: 8;
+    margin: 0 0 1 0;
+    padding: 1;
+    background: $surface;
+    border: solid $border;
+}
+
+TaskCard.-selected {
+    border: double $accent;
+    background: $surface-hl;
+}
+
+TaskCard.-has-agent {
+    border-left: thick $success;
+}
+
+TaskCard.-stale {
+    border-left: thick $danger;
+}
+
+TaskCard.-waiting {
+    border-left: thick $warning;
+}
+
+/* --- Modals --- */
+
+TaskInputDialog {
+    align: center middle;
+}
+
+#task-input-container {
+    width: 60;
+    height: auto;
+    max-height: 20;
+    background: $surface;
+    border: double $accent;
+    padding: 1 2;
+}
+
+#task-input-container Label {
+    color: $text;
+    padding: 1 0 0 0;
+}
+
+#task-input-container Input {
+    margin: 0 0 1 0;
+}
+
+#task-input-container TextArea {
+    height: 5;
+    margin: 0 0 1 0;
+}
+
+ConfirmDialog {
+    align: center middle;
+}
+
+#confirm-container {
+    width: 50;
+    height: auto;
+    background: $surface;
+    border: double $danger;
+    padding: 1 2;
+}
+
+#confirm-buttons {
+    height: 3;
+    margin: 1 0 0 0;
+}
+
+#confirm-buttons Button {
+    width: 1fr;
+    margin: 0 1;
+}
+
+/* --- Agent Panel --- */
+
+AgentPanel {
+    align: center middle;
+}
+
+#agent-panel {
+    width: 90%;
+    height: 80%;
+    background: $surface;
+    border: double $accent;
+    padding: 1;
+}
+
+#agent-scroll {
+    height: 1fr;
+    border: solid $border;
+    padding: 1;
+}
+
+#agent-output {
+    color: $text;
+}
+
+#agent-help {
+    dock: bottom;
+    height: 1;
+    color: $text-dim;
+    margin: 0 0 0 0;
+}
+
+#agent-input {
+    dock: bottom;
+    margin: 0;
+}
+
+/* --- Diff View --- */
+
+DiffView {
+    align: center middle;
+}
+
+#diff-view {
+    width: 90%;
+    height: 80%;
+    background: $surface;
+    border: double $accent;
+    padding: 1;
+}
+
+#diff-content {
+    color: $text;
+}
+
+/* --- Footer --- */
+
+Footer {
+    dock: bottom;
+    background: $surface;
+}
