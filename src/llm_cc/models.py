@@ -87,12 +87,20 @@ class AgentConfig(BaseModel):
     name: str
     command: str | None = None
     args_template: str = "{prompt}"
+    model: str | None = None          # model name for display + {model} in args_template
     mode: AgentMode = AgentMode.PTY
     api_provider: str | None = None
     api_model: str | None = None
     resume_template: str | None = None
     co_author: str = ""
     detect_command: str | None = None
+
+    @property
+    def display_label(self) -> str:
+        """Agent name + model for UI, e.g. 'claude opus-4.6'."""
+        if self.model:
+            return f"{self.name} {self.model}"
+        return self.name
 
 
 # --- Pipeline ---
@@ -119,6 +127,7 @@ class GitMode(str, Enum):
 class GitConfig(BaseModel):
     mode: GitMode = GitMode.NONE
     base_branch: str = "main"
+    branch_prefix: str = "task/"  # prefix for branch names, e.g. "task/" → "task/a1b2-slug"
     copy_files: list[str] = []
     init_script: str | None = None
 
@@ -133,6 +142,9 @@ class ProjectConfig(BaseModel):
     pipeline: list[PipelineStage] = []
     agents: dict[str, AgentConfig] = {}
     stage_labels: dict[str, str] = {}
+    plan_dir: str = ".llm-cc/tasks/{id}"  # template: {id}, {slug}, {branch}, {title}
+    plan_file: str = "plan.md"  # constant filename within plan_dir
+    review_file: str | None = None  # optional: where review agent writes summary (resolved in plan_dir)
 
 
 class GlobalConfig(BaseModel):
@@ -169,6 +181,14 @@ class MergedConfig(BaseModel):
             if stage.stage == status:
                 return stage
         return None
+
+    def active_stages(self) -> list[TaskStatus]:
+        """Stages visible on the board: BACKLOG + configured stages + DONE."""
+        configured = {s.stage for s in self.pipeline}
+        return [
+            s for s in STAGE_ORDER
+            if s in (TaskStatus.BACKLOG, TaskStatus.DONE) or s in configured
+        ]
 
     def label_for(self, status: TaskStatus) -> str:
         """Get display label for a stage (custom or default)."""

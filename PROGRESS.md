@@ -62,6 +62,41 @@
 - [x] File-based context flow (.llm-cc/tasks/<id>/ with task.md, diff.md, *-output.md)
 - [x] Removed in-memory context passing (review_feedback field → file-based)
 
+## Phase 9: Configurable Plan Paths & Branch Naming — COMPLETE
+
+- [x] `plan_dir` template in ProjectConfig (variables: {id}, {slug}, {branch}, {title})
+- [x] `plan_file` constant in ProjectConfig (default: "plan.md")
+- [x] `branch_prefix` in GitConfig (default: "task/", configurable per-project)
+- [x] `_resolve_plan_path()` in pipeline.py with path traversal protection
+- [x] Per-stage prompt builders (_build_planning_prompt, _build_execute_prompt, _build_review_prompt)
+- [x] plan_path resolved after git.setup() in PLANNING stage (timing fix)
+- [x] Playbook project config: plans/{branch}/PLAN.md, branch mode, empty prefix
+
+## Phase 10: Optional Stages & Dynamic Board — COMPLETE
+
+- [x] Optional pipeline stages: only `[[pipeline]]` entries appear as board columns
+- [x] `_next_status()` / `_prev_status()` skip unconfigured stages
+- [x] `MergedConfig.active_stages()` returns visible stage list
+- [x] Dynamic board columns: `BoardScreen` renders only configured stages
+- [x] Column index tracking: `KanbanColumn.col_idx` for click events
+- [x] `_follow_task()` safety guard for tasks in invisible stages
+- [x] Git none-mode branch detection: detects current branch for `{branch}` template without creating branches
+- [x] `git.setup()` called in EXECUTE when PLANNING stage is skipped
+- [x] `_resolve_plan_path()` validates `{branch}` before `format()` (clearer errors)
+- [x] Playbook config: planning stage removed (agent plans via CLAUDE.md)
+
+## Phase 11: Agent Display, Model Config & Review Output — COMPLETE
+
+- [x] `model` field on AgentConfig: shown in column headers, auto-injected as `--model` flag
+- [x] `display_label` property on AgentConfig: `"{name} {model}"` for UI
+- [x] Column headers: stage name → agent name → model name → task count
+- [x] DSR response in PTY poll loop: responds to `\x1b[6n` cursor position queries (Codex compatibility)
+- [x] Execute slot validation: both `GitMode.NONE` and `GitMode.BRANCH` restrict to one task in Execute
+- [x] `review_file` on ProjectConfig: optional path where review agent writes summary (resolved in `plan_dir`)
+- [x] Review prompt includes `Write your review to: {path}` when `review_file` is set
+- [x] Waiting detection reverted to simple implementation (no hysteresis — brief flickering is acceptable)
+- [x] Playbook config: `model = "opus-4.6"` for claude, `model = "gpt-5"` for codex, `review_file = "PLAN.md"`
+
 ---
 
 ## Reliability Fixes — ALL COMPLETE
@@ -72,31 +107,22 @@
 - [x] Buffer: cleanup on stop, log file opened once per session
 - [x] Keys: event isolation in agent panel input mode
 - [x] PTY: pyte terminal emulator (not regex ANSI stripping)
-- [x] Input detection: full screen search (not bottom N lines)
+- [x] Input detection: full screen search (not bottom N lines), stability + pattern matching
 - [x] Worker groups: pipeline ops share group, diff is independent
 - [x] Base branch: auto-detect (main → master → develop)
 - [x] Stale sessions: cleared on startup
 
 ---
 
-## File Inventory
+## Phase 12: Agent Panel UX — COMPLETE
 
-| File | Lines | Status |
-|------|-------|--------|
-| `pyproject.toml` | ~45 | Done |
-| `src/llm_cc/__init__.py` | 3 | Done |
-| `src/llm_cc/__main__.py` | 48 | Done |
-| `src/llm_cc/models.py` | 177 | Simplified |
-| `src/llm_cc/storage.py` | 219 | Hardened |
-| `src/llm_cc/utils.py` | 72 | Done |
-| `src/llm_cc/app.py` | 65 | Done |
-| `src/llm_cc/ui/board.py` | 521 | Rewritten |
-| `src/llm_cc/ui/panels.py` | 254 | Hardened |
-| `src/llm_cc/ui/styles.tcss` | 202 | Done |
-| `src/llm_cc/git.py` | 258 | Done |
-| `src/llm_cc/agents.py` | 496 | Hardened |
-| `src/llm_cc/pipeline.py` | 170 | Rewritten |
-| **Total** | **~2,530** | |
+- [x] Fullscreen agent panel (100% width/height CSS)
+- [x] ANSI color preservation: `display_rich()` walks pyte per-character style attributes → Rich `Text`
+- [x] Scrollback history: `pyte.HistoryScreen` (5000 lines), `history_rich()` for styled history
+- [x] Smart auto-scroll: position-based detection — only scrolls to bottom if user was already there
+- [x] Scroll keybinds: Shift+PageUp/Down, Shift+Home/End, mouse wheel
+- [x] Dynamic PTY sizing: pyte buffer + pexpect dimensions match real terminal, resize on panel open/terminal resize
+- [x] Backend API: `get_output_rich()`, `get_history_rich()`, `resize_session()` on PtyBackend
 
 ---
 

@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import os
 import shlex
 import shutil
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 import pyte
+from rich.style import Style
+from rich.text import Text
 
 from .models import AgentConfig, AgentMode, Task, TaskStatus
 
@@ -25,6 +28,8 @@ class AgentBackend(Protocol):
     async def send_input(self, session_id: str, text: str) -> None: ...
     async def send_raw(self, session_id: str, data: str) -> None: ...
     async def get_output(self, session_id: str) -> str: ...
+    async def get_output_rich(self, session_id: str) -> Text | None: ...
+    async def get_history_rich(self, session_id: str) -> list[Text]: ...
     def is_alive(self, session_id: str) -> bool: ...
 
 
@@ -60,11 +65,12 @@ class OutputBuffer:
     """Terminal emulator buffer. Uses pyte to properly decode PTY output."""
 
     def __init__(self, log_path: Path | None = None, cols: int = 120, rows: int = 40) -> None:
-        self._screen = pyte.Screen(cols, rows)
+        self._screen = pyte.HistoryScreen(cols, rows, history=5000)
         self._stream = pyte.Stream(self._screen)
         self._log_file = None
         self._last_content: str = ""
         self._stable_ticks: int = 0  # how many polls the screen hasn't changed
+        self._was_waiting: bool = False  # hysteresis: stay waiting until content truly changes
         if log_path:
             log_path.parent.mkdir(parents=True, exist_ok=True)
             self._log_file = open(log_path, "a")
@@ -93,6 +99,113 @@ class OutputBuffer:
             cleaned.pop()
         return "\n".join(cleaned)
 
+    @staticmethod
+    def _pyte_color_to_rich(color: str, background: bool = False) -> str:
+        """Convert a pyte color value to a Rich style string."""
+        if color == "default" or not color:
+            return ""
+        # Named colors — Rich supports them directly
+        named = {
+            "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white",
+            "bright_black", "bright_red", "bright_green", "bright_yellow",
+            "bright_blue", "bright_magenta", "bright_cyan", "bright_white",
+        }
+        # pyte uses "brown" for yellow sometimes
+        if color == "brown":
+            color = "yellow"
+        if color in named:
+            return f"on {color}" if background else color
+        # Hex color string (256-color or truecolor, e.g. "ff8700")
+        if len(color) == 6:
+            try:
+                int(color, 16)
+                return f"on #{color}" if background else f"#{color}"
+            except ValueError:
+                pass
+        return ""
+
+    def _row_to_rich(self, row: dict) -> Text:
+        """Convert a pyte screen row (dict of col -> Char) to a Rich Text."""
+        if not row:
+            return Text("")
+        max_col = max(row.keys()) if row else 0
+        result = Text()
+        span_chars: list[str] = []
+        span_style: Style | None = None
+
+        for col in range(max_col + 1):
+            char = row.get(col)
+            if char is None:
+                ch = " "
+                fg_str = ""
+                bg_str = ""
+                bold = False
+                italic = False
+                underline = False
+            else:
+                ch = char.data if char.data else " "
+                fg_str = self._pyte_color_to_rich(char.fg)
+                bg_str = self._pyte_color_to_rich(char.bg, background=True)
+                bold = char.bold
+                italic = char.italics
+                underline = char.underscore
+
+            parts = [s for s in (fg_str, bg_str) if s]
+            if bold:
+                parts.append("bold")
+            if italic:
+                parts.append("italic")
+            if underline:
+                parts.append("underline")
+            style = Style.parse(" ".join(parts)) if parts else Style.null()
+
+            if style == span_style:
+                span_chars.append(ch)
+            else:
+                if span_chars:
+                    result.append("".join(span_chars), span_style)
+                span_chars = [ch]
+                span_style = style
+
+        if span_chars:
+            result.append("".join(span_chars), span_style)
+
+        # Strip trailing whitespace
+        result.rstrip()
+        return result
+
+    def display_rich(self) -> Text:
+        """Get current screen content as a Rich Text with ANSI colors preserved."""
+        lines: list[Text] = []
+        for row_idx in range(self._screen.lines):
+            row = self._screen.buffer[row_idx]
+            lines.append(self._row_to_rich(row))
+        # Drop trailing empty lines
+        while lines and not lines[-1].plain.strip():
+            lines.pop()
+        result = Text()
+        for i, line in enumerate(lines):
+            if i > 0:
+                result.append("\n")
+            result.append_text(line)
+        return result
+
+    def history_rich(self) -> list[Text]:
+        """Get scrollback history lines as Rich Text objects."""
+        result: list[Text] = []
+        for row in self._screen.history.top:
+            result.append(self._row_to_rich(row))
+        return result
+
+    @property
+    def total_lines(self) -> int:
+        """Total lines: history + active screen lines."""
+        return len(self._screen.history.top) + self._screen.lines
+
+    def resize(self, cols: int, rows: int) -> None:
+        """Resize the virtual terminal."""
+        self._screen.resize(rows, cols)
+
     @property
     def appears_waiting(self) -> bool:
         """Heuristic: agent seems to be waiting for user input.
@@ -100,11 +213,27 @@ class OutputBuffer:
         Triggers when the visible screen content hasn't changed for ~0.3s
         AND the screen matches known input prompt patterns.
         Searches full screen since CLI prompts can render anywhere.
+
+        Hysteresis: once waiting is detected, stays waiting even through
+        brief screen redraws (cursor repositioning, selection highlight).
+        Only clears when patterns stop matching after sustained change.
         """
-        if self._stable_ticks < 3:  # screen still changing (~0.3s)
-            return False
         screen_text = self.display().lower()
-        return any(p in screen_text for p in _INPUT_PATTERNS)
+        has_pattern = any(p in screen_text for p in _INPUT_PATTERNS)
+
+        if self._stable_ticks >= 3 and has_pattern:
+            self._was_waiting = True
+            return True
+
+        if self._was_waiting:
+            # Stay waiting through brief redraws — only clear after
+            # sustained change (10+ ticks = ~1s) or patterns disappear
+            if not has_pattern and self._stable_ticks >= 10:
+                self._was_waiting = False
+                return False
+            return True
+
+        return False
 
     def close(self) -> None:
         """Close log file if open."""
@@ -129,7 +258,7 @@ class PtyBackend:
         self._interrupted: set[str] = set()  # sessions with pending interrupt
         self._pm = process_manager
 
-    async def start(self, config: AgentConfig, task: Task, prompt: str, cwd: Path, stage: str = "", cli_flags: str = "") -> str:
+    async def start(self, config: AgentConfig, task: Task, prompt: str, cwd: Path, stage: str = "", cli_flags: str = "", terminal_size: tuple[int, int] | None = None) -> str:
         import pexpect
 
         session_id = f"pty_{task.id}_{stage or task.status.value}"
@@ -141,15 +270,30 @@ class PtyBackend:
         if not config.command:
             raise ValueError(f"Agent '{config.name}' has no command configured for PTY mode")
 
-        # Build command
+        # Build command — inject --model if model is set and not in args_template
+        model_flag = ""
+        if config.model and "{model}" not in config.args_template:
+            model_flag = f"--model {config.model}"
         cmd_args = config.args_template.format(
             prompt=shlex.quote(prompt),
             session_id=task.id,
+            model=config.model or "",
         )
-        full_cmd = f"{config.command} {cli_flags} {cmd_args}".strip() if cli_flags else f"{config.command} {cmd_args}"
+        parts = [config.command, model_flag, cli_flags, cmd_args]
+        full_cmd = " ".join(p for p in parts if p).strip()
 
         # Log path
         log_path = cwd / ".llm-cc" / "logs" / f"{session_id}.log"
+
+        # Terminal dimensions — use provided size, real terminal, or defaults
+        if terminal_size:
+            cols, rows = terminal_size
+        else:
+            try:
+                ts = os.get_terminal_size()
+                cols, rows = ts.columns, ts.lines
+            except OSError:
+                cols, rows = 120, 40
 
         # Spawn in PTY
         child = pexpect.spawn(
@@ -157,11 +301,11 @@ class PtyBackend:
             cwd=str(cwd),
             encoding="utf-8",
             timeout=None,
-            dimensions=(40, 120),
+            dimensions=(rows, cols),
         )
 
         self._sessions[session_id] = child
-        self._buffers[session_id] = OutputBuffer(log_path=log_path)
+        self._buffers[session_id] = OutputBuffer(log_path=log_path, cols=cols, rows=rows)
 
         # Register with process manager for crash cleanup
         if self._pm:
@@ -244,6 +388,26 @@ class PtyBackend:
         buf = self._buffers.get(session_id)
         return buf.display() if buf else ""
 
+    async def get_output_rich(self, session_id: str) -> Text | None:
+        buf = self._buffers.get(session_id)
+        return buf.display_rich() if buf else None
+
+    async def get_history_rich(self, session_id: str) -> list[Text]:
+        buf = self._buffers.get(session_id)
+        return buf.history_rich() if buf else []
+
+    def resize_session(self, session_id: str, cols: int, rows: int) -> None:
+        """Resize PTY and virtual terminal buffer for a session."""
+        buf = self._buffers.get(session_id)
+        if buf:
+            buf.resize(cols, rows)
+        child = self._sessions.get(session_id)
+        if child and hasattr(child, "setwinsize"):
+            try:
+                child.setwinsize(rows, cols)
+            except Exception:
+                pass
+
     def is_alive(self, session_id: str) -> bool:
         child = self._sessions.get(session_id)
         return child is not None and hasattr(child, "isalive") and child.isalive()
@@ -284,6 +448,12 @@ class PtyBackend:
                     data = child.read_nonblocking(size=4096, timeout=0)
                     if data:
                         buf.append(data)
+                        # Respond to cursor position queries (DSR).
+                        # CLIs like codex send \x1b[6n to detect terminal size.
+                        if "\x1b[6n" in data:
+                            row = buf._screen.cursor.y + 1
+                            col = buf._screen.cursor.x + 1
+                            child.send(f"\x1b[{row};{col}R")
                 # Always check screen stability — even when raw data flows
                 # (cursor blinks, escape codes), the rendered content may be stable
                 buf.mark_idle()
@@ -345,7 +515,7 @@ class ApiBackend:
 
         client = anthropic.AsyncAnthropic()
         msg = await client.messages.create(
-            model=config.api_model or "claude-sonnet-4-20250514",
+            model=config.api_model or config.model or "claude-sonnet-4-6",
             max_tokens=4096,
             messages=[{"role": "user", "content": prompt}],
         )
@@ -360,7 +530,7 @@ class ApiBackend:
 
         client = openai.AsyncOpenAI()
         resp = await client.chat.completions.create(
-            model=config.api_model or "gpt-4o",
+            model=config.api_model or config.model or "gpt-4o",
             messages=[{"role": "user", "content": prompt}],
         )
         if resp.choices:

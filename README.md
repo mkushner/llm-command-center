@@ -2,7 +2,7 @@
 
 A terminal UI that orchestrates AI coding agents through configurable pipelines. Kanban board with vim keybindings, native PTY agent management, file-based context flow between stages.
 
-~2,600 lines of Python. No frameworks beyond Textual (TUI), pexpect (PTY), pyte (terminal emulation), Pydantic (models).
+No frameworks beyond Textual (TUI), pexpect (PTY), pyte (terminal emulation), Pydantic (models).
 
 ```
 llm-cc /path/to/project
@@ -12,13 +12,19 @@ llm-cc /path/to/project
 
 ## How It Works
 
-Tasks flow through a 5-column kanban board. Each stage spawns an agent (Claude, Codex, etc.) in a pseudo-terminal. All transitions are manual — you decide when to advance, revert, or restart.
+Tasks flow through a kanban board. Each stage spawns an agent (Claude, Codex, etc.) in a pseudo-terminal. All transitions are manual — you decide when to advance, revert, or restart.
+
+Stages are **optional** — only stages with `[[pipeline]]` entries appear as columns. BACKLOG and DONE are always present.
 
 ```
+Default (all stages):
 Backlog ──m──> Planning ──m──> Execute ──m──> Review ──m──> Done
-                                   ^              |
-                                   └──────b───────┘
-                                   (with review feedback)
+
+Minimal (skip planning — agent plans internally via CLAUDE.md):
+Backlog ──m──> Execute ──m──> Review ──m──> Done
+
+Execute only:
+Backlog ──m──> Execute ──m──> Done
 ```
 
 ### Context Flow
@@ -44,6 +50,8 @@ The board polls active agents every 2s and shows a yellow **WAITING FOR INPUT** 
 
 1. **Screen stability** — the pyte terminal buffer hasn't changed for 3+ poll ticks (~0.3s)
 2. **Pattern matching** — full screen text matches known input patterns
+
+Both must be true simultaneously. Brief flickering (green→yellow→green) can occur when agents redraw the screen — this is expected and draws attention to prompts that need response.
 
 ```python
 _INPUT_PATTERNS = (
@@ -82,12 +90,17 @@ Agents are prompted to say `PLANNING COMPLETE` / `EXECUTE COMPLETE` / `REVIEW CO
 
 ### Agent Panel
 
-`Enter` opens a modal showing the agent's live PTY output. Keys are forwarded directly to the agent:
+`Enter` opens a fullscreen modal showing the agent's live PTY output with ANSI colors preserved. The panel uses pyte's `HistoryScreen` for scrollback (5000 lines) and renders styled Rich `Text` objects. The PTY is dynamically resized to match the panel dimensions.
+
+Keys are forwarded directly to the agent:
 
 - All printable characters, Enter, Tab, arrows → sent to PTY
 - `Esc` → close panel
 - `Ctrl+C` → send interrupt to agent
 - `Ctrl+T` → toggle text input mode (for longer prompts)
+- `Shift+PageUp/PageDown` → scroll output history
+- `Shift+Home/End` → jump to top / resume auto-scroll
+- Mouse wheel → scroll (auto-scroll resumes when you reach the bottom)
 
 ---
 
@@ -107,16 +120,17 @@ name = "my-project"
 [git]
 mode = "none"
 base_branch = "main"
+branch_prefix = "task/"   # prefix for branch names; "" for flat naming
 
 # Define agents
 [agents.claude_opus]
 command = "claude"
-args_template = "--model claude-opus-4-6 {prompt}"
+model = "claude-opus-4-6"                # shown in column header + auto-injected as --model flag
 mode = "pty"
 
 [agents.claude_sonnet]
 command = "claude"
-args_template = "--model claude-sonnet-4-6 {prompt}"
+model = "claude-sonnet-4-6"
 mode = "pty"
 
 # Pipeline: which agent runs at each stage
@@ -139,6 +153,25 @@ execute = "Build"
 review = "QA"
 ```
 
+### Plan file location
+
+Configure where the planning agent writes its plan:
+
+```toml
+[project]
+plan_dir = "plans/{branch}"   # template: {id}, {slug}, {branch}, {title}
+plan_file = "PLAN.md"         # constant filename within plan_dir
+review_file = "PLAN.md"       # optional: where review agent writes summary (in plan_dir)
+```
+
+Defaults: `plan_dir = ".llm-cc/tasks/{id}"`, `plan_file = "plan.md"`, `review_file = None`. The `{branch}` variable works with any git mode — `worktree` and `branch` modes create branches; `none` mode detects the current branch name without creating one (so you can manually check out a branch and `{branch}` resolves).
+
+All stages reference the same plan path — planning writes it, execute reads it, review checks against it. Path traversal is blocked (resolved path must stay inside project directory).
+
+When `review_file` is set, the review prompt includes a hint: `Write your review to: {plan_dir}/{review_file}`. This is a suggestion — the agent decides whether to follow it. Useful for keeping review output alongside the plan (e.g., both in `plans/{branch}/`).
+
+If the PLANNING stage is skipped (no `[[pipeline]]` entry), git workspace setup happens at EXECUTE instead. The execute agent creates the plan itself (e.g., via CLAUDE.md rules) and the review agent still gets the plan path reference.
+
 ### Agent resolution
 
 When a task enters a stage, the agent is resolved in order:
@@ -152,10 +185,10 @@ When a task enters a stage, the agent is resolved in order:
 | Mode | Behavior | Concurrent Execute |
 |------|----------|-------------------|
 | `none` | Agent runs in project directory as-is | One task at a time |
-| `worktree` | Each task gets its own git worktree under `.llm-cc/worktrees/` | Unlimited |
 | `branch` | Creates a branch, no directory isolation | One task at a time |
+| `worktree` | Each task gets its own git worktree under `.llm-cc/worktrees/` | Unlimited |
 
-`none` is the default. With worktree/branch modes, the pipeline creates git branches named `task/<id>-<slug>` and manages workspace setup (file copying, init scripts).
+`none` is the default. With worktree/branch modes, the pipeline creates git branches named `{branch_prefix}<id>-<slug>` and manages workspace setup (file copying, init scripts). The `branch_prefix` defaults to `task/` but is configurable (set to `""` for flat branch names).
 
 ### Built-in agents
 
@@ -169,12 +202,14 @@ An "agent" is a named config, not a product. The same CLI with different models 
 ```toml
 [agents.planner]
 command = "claude"
-args_template = "--model claude-opus-4-6 {prompt}"
+model = "claude-opus-4-6"
 
 [agents.coder]
 command = "claude"
-args_template = "--model claude-sonnet-4-6 {prompt}"
+model = "claude-sonnet-4-6"
 ```
+
+When `model` is set, it's auto-injected as `--model {model}` into the command unless `{model}` already appears in `args_template`. The model name also appears in the board column header alongside the agent name.
 
 ### Agent modes
 
@@ -236,7 +271,7 @@ PipelineEngine
     └── git ops via GitWorkspace
     ↕
 BoardScreen (Textual)
-    ├── renders 5 columns from TaskStore
+    ├── renders columns for configured stages from TaskStore
     ├── polls agent status every 2s (waiting detection)
     └── dispatches user actions (m/b/r/s/x) to PipelineEngine
 ```
@@ -269,8 +304,8 @@ Agent behavior is configured via project files the agent natively reads (`CLAUDE
 ```
 PLANNING: Fix login bug
 
-Task docs: .llm-cc/tasks/a1b2c3d4/
-Read .llm-cc/tasks/a1b2c3d4/task.md for the task description.
+Task description: .llm-cc/tasks/a1b2c3d4/task.md
+Write your plan to: plans/a1b2-fix-login-bug/PLAN.md
 
 When finished, say: PLANNING COMPLETE
 ```
@@ -310,7 +345,7 @@ CLI agents output complex VT100 escape sequences — cursor positioning, screen 
 - Tab stops
 - Multi-byte sequences
 
-pyte is a full terminal emulator. Feed it raw PTY output, get a 40x120 character grid back. This is what `OutputBuffer` uses for both display rendering and input pattern detection.
+pyte is a full terminal emulator. Feed it raw PTY output, get a character grid back. `OutputBuffer` uses `pyte.HistoryScreen` (with 5000-line scrollback) for both display rendering and input pattern detection. The `display_rich()` method walks pyte's per-character style attributes (fg, bg, bold, italic, underscore) and reconstructs Rich `Text` objects with proper colors — including named colors, 256-color, and truecolor. The PTY and pyte buffer are dynamically sized to match the actual terminal dimensions.
 
 ### Why flat JSON (not SQLite)
 
@@ -377,6 +412,7 @@ class AgentConfig(BaseModel):
     name: str                        # e.g. "claude", "codex", "claude_opus"
     command: str | None              # CLI binary (PTY mode)
     args_template: str               # how prompt is passed, e.g. "{prompt}"
+    model: str | None                # model name — shown in UI, auto-injected as --model flag
     mode: AgentMode                  # "pty" or "api"
     api_provider: str | None         # "anthropic" or "openai" (API mode)
     api_model: str | None            # model ID (API mode)
@@ -395,6 +431,32 @@ class PipelineStage(BaseModel):
     prompt_template: str | None      # custom prompt (future)
     cli_flags: str                   # extra CLI flags
     auto: bool                       # auto-run without user trigger (future)
+```
+
+### Project config
+
+```python
+class ProjectConfig(BaseModel):
+    name: str
+    github_url: str | None
+    git: GitConfig
+    pipeline: list[PipelineStage]
+    agents: dict[str, AgentConfig]
+    stage_labels: dict[str, str]         # custom column labels
+    plan_dir: str = ".llm-cc/tasks/{id}" # template: {id}, {slug}, {branch}, {title}
+    plan_file: str = "plan.md"           # constant filename within plan_dir
+    review_file: str | None = None       # optional: where review agent writes summary (in plan_dir)
+```
+
+### Git config
+
+```python
+class GitConfig(BaseModel):
+    mode: GitMode = GitMode.NONE         # "none", "worktree", or "branch"
+    base_branch: str = "main"            # auto-detected from repo
+    branch_prefix: str = "task/"         # prefix for branch names
+    copy_files: list[str] = []           # files to copy into worktrees
+    init_script: str | None = None       # script to run in new worktrees
 ```
 
 ### Config hierarchy
@@ -429,11 +491,12 @@ class AgentBackend(Protocol):
 
 Spawns CLI agents in native pseudo-terminals via pexpect:
 
-1. **Command construction**: `{command} {cli_flags} {args_template.format(prompt=quoted_prompt)}`
-2. **Output polling**: background asyncio.Task reads PTY at 0.1s intervals, feeds data into pyte `OutputBuffer`
-3. **Disk logging**: all PTY output written to `.llm-cc/logs/{session_id}.log`
-4. **Session IDs**: `pty_{task_id}_{stage}` — e.g. `pty_a1b2c3d4_planning`
-5. **Orphan prevention**: `start()` stops old session if same ID exists; `_ProcessManager` singleton registered with `atexit` kills all children on crash
+1. **Command construction**: `{command} --model {model} {cli_flags} {args_template.format(prompt=quoted_prompt)}` — model flag auto-injected when `model` is set and `{model}` not in `args_template`
+2. **Output polling**: background asyncio.Task reads PTY at 0.1s intervals, feeds data into pyte `OutputBuffer` (uses `HistoryScreen` with 5000-line scrollback and Rich text rendering)
+3. **DSR response**: responds to cursor position queries (`\x1b[6n`) that some CLIs (e.g., Codex) use for terminal size detection
+4. **Disk logging**: all PTY output written to `.llm-cc/logs/{session_id}.log`
+5. **Session IDs**: `pty_{task_id}_{stage}` — e.g. `pty_a1b2c3d4_planning`
+6. **Orphan prevention**: `start()` stops old session if same ID exists; `_ProcessManager` singleton registered with `atexit` kills all children on crash
 
 ### API Backend
 
@@ -479,14 +542,15 @@ TOML parsed via stdlib `tomllib` (Python 3.12+). No extra dependency.
 
 ```python
 async def advance(task):
-    # 1. Stop current agent (capture output to file if leaving REVIEW)
-    # 2. Ensure task docs dir exists (.llm-cc/tasks/<id>/)
-    # 3. Match on next stage:
+    # 1. Compute next stage (skipping unconfigured stages)
+    # 2. Stop current agent (capture output to file if leaving active stage)
+    # 3. Ensure task docs dir exists (.llm-cc/tasks/<id>/)
+    # 4. Match on next stage:
     #    PLANNING: git setup + start agent
-    #    EXECUTE:  validate slot (GitMode.NONE) + start agent
+    #    EXECUTE:  git setup (if no PLANNING) + validate slot (NONE/BRANCH) + start agent
     #    REVIEW:   write diff.md + start agent
     #    DONE:     cleanup git, clear session
-    # 4. Save task to storage
+    # 5. Save task to storage
 
 async def revert(task):
     # 1. Capture current stage output to file
@@ -503,22 +567,17 @@ async def restart(task):
 
 ### Prompt building
 
-One method for all stages. Minimal — points agent at docs directory:
+Per-stage prompt builders. Each is minimal — points agent at task docs and plan file:
 
-```
-{STAGE}: {task.title}
+- **Planning**: task description + plan path to write to
+- **Execute**: task description + plan path to read
+- **Review**: task description + plan path + diff.md
 
-Task docs: .llm-cc/tasks/{id}/
-Read .llm-cc/tasks/{id}/task.md for the task description.
-
-When finished, say: {STAGE} COMPLETE
-```
-
-The agent discovers context by reading files. The planning agent writes whatever it wants. The execute agent reads the planning output. The review agent gets a pre-written `diff.md`. Users configure agent behavior via `CLAUDE.md` and project-level agent config — not through our prompt templates.
+The agent discovers context by reading files. The planning agent writes a plan to the configured `plan_dir/plan_file`. The execute agent reads it. The review agent gets a pre-written `diff.md`. Users configure agent behavior via `CLAUDE.md` and project-level agent config — not through our prompt templates.
 
 ### Execute slot validation
 
-When `git.mode = "none"`, only one task can be in Execute at a time (agents share the working directory). With worktree mode, unlimited concurrent Execute tasks.
+When `git.mode` is `"none"` or `"branch"`, only one task can be in Execute at a time (agents share the working directory). With `"worktree"` mode, unlimited concurrent Execute tasks.
 
 ---
 
@@ -526,7 +585,9 @@ When `git.mode = "none"`, only one task can be in Execute at a time (agents shar
 
 ### Columns
 
-5 `KanbanColumn` widgets in a `Horizontal` container, one per `TaskStatus`. Each column holds `TaskCard` widgets rendered from `TaskStore.by_status()`.
+`KanbanColumn` widgets in a `Horizontal` container, one per configured stage (from `MergedConfig.active_stages()`). Only stages with `[[pipeline]]` entries are shown; BACKLOG and DONE always appear. Each column holds `TaskCard` widgets rendered from `TaskStore.by_status()`.
+
+Column headers show: stage name, agent name, model name, and task count. Agent and model are resolved from the `[[pipeline]]` stage config and the corresponding `[agents.*]` entry.
 
 ### Task card indicators
 
@@ -563,7 +624,7 @@ Separate lock file (`tasks.lock`). Lock acquired before any read or write. Atomi
 All `@work` methods accept `task_id: str`, not `Task` object. Workers re-read from storage before mutating. Confirmation dialog closures capture `task_id` (stable), not task object (may be stale).
 
 ### Buffer memory
-`PtyBackend.stop()` cleans up buffers (close log file handle, remove from dict). Log file opened once per session, not per-append.
+`PtyBackend.stop()` cleans up buffers (close log file handle, remove from dict). Log file opened once per session, not per-append. `HistoryScreen` caps scrollback at 5000 lines to bound memory usage.
 
 ### Key event isolation
 AgentPanel `on_key` always calls `event.prevent_default()` + `event.stop()` when in input mode. Prevents board-level vim bindings from firing while typing in the agent panel.
@@ -619,6 +680,7 @@ openai>=1.60       # API backend
 ├── tasks/                   # per-task docs (context between stages)
 │   └── <task-id>/
 │       ├── task.md
+│       ├── plan.md           # (default location; configurable via plan_dir)
 │       ├── planning-output.md
 │       ├── diff.md
 │       └── review-output.md
@@ -628,10 +690,10 @@ openai>=1.60       # API backend
     └── <id>-<slug>/
 ```
 
-Add `.llm-cc` to your global gitignore:
+Add `.llm-cc` to your global gitignore (check `git config --global core.excludesFile` for your file location):
 
 ```bash
-mkdir -p ~/.config/git && echo ".llm-cc" >> ~/.config/git/ignore
+echo ".llm-cc" >> "$(git config --global core.excludesFile)"
 ```
 
 ---

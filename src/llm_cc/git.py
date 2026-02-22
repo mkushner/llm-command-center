@@ -72,7 +72,17 @@ class GitWorkspace:
     async def setup(self, task: Task) -> Path:
         """Create workspace for a task. Returns working directory path."""
         if not self._git_enabled:
-            # No git — agent runs directly in project directory
+            # No git ops, but detect current branch for template resolution
+            if self.is_git_repo() and not task.branch_name:
+                result = await async_run(
+                    ["git", "branch", "--show-current"],
+                    cwd=self.project_path,
+                    capture=True,
+                    check=False,
+                )
+                branch = result.stdout.strip()
+                if branch:
+                    task.branch_name = branch
             return self.project_path
 
         if self.config.mode == GitMode.WORKTREE:
@@ -82,7 +92,7 @@ class GitWorkspace:
     async def _setup_worktree(self, task: Task) -> Path:
         slug = task.slug()
         wt_path = self.project_path / ".llm-cc" / "worktrees" / slug
-        branch = f"task/{slug}"
+        branch = f"{self.config.branch_prefix}{slug}"
 
         # Remove stale worktree if exists (git command first, then force-delete dir)
         if wt_path.exists():
@@ -135,7 +145,7 @@ class GitWorkspace:
         """Branch-only mode. Lock prevents concurrent checkouts."""
         async with self._branch_lock:
             slug = task.slug()
-            branch = f"task/{slug}"
+            branch = f"{self.config.branch_prefix}{slug}"
             await async_run(
                 ["git", "checkout", "-b", branch, self.config.base_branch],
                 cwd=self.project_path,

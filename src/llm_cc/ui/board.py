@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from textual import on, work
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -12,7 +14,7 @@ from textual.screen import Screen
 from textual.widgets import Footer, Static
 
 from llm_cc.agents import AgentRegistry, PtyBackend
-from llm_cc.models import STAGE_ORDER, Task, TaskStatus
+from llm_cc.models import Task, TaskStatus
 from llm_cc.pipeline import PipelineEngine
 from llm_cc.storage import Storage
 from llm_cc.ui.panels import AgentPanel, ConfirmDialog, DiffView, TaskInputDialog
@@ -70,15 +72,25 @@ class TaskCard(Static, can_focus=False):
 class KanbanColumn(VerticalScroll, can_focus=False):
     """A single column in the kanban board."""
 
-    def __init__(self, status: TaskStatus, label: str) -> None:
+    def __init__(
+        self, status: TaskStatus, label: str, col_idx: int = 0,
+        agent_name: str = "", model_name: str = "",
+    ) -> None:
         super().__init__()
         self.status = status
         self.label = label
+        self.col_idx = col_idx
+        self.agent_name = agent_name
+        self.model_name = model_name
         self._tasks: list[Task] = []
         self._selected: int = 0
 
     def compose(self) -> ComposeResult:
         yield Static(self.label, classes="column-header")
+        if self.agent_name:
+            yield Static(f"[dim]{self.agent_name}[/]", classes="column-agent")
+        if self.model_name:
+            yield Static(f"[dim]{self.model_name}[/]", classes="column-model")
         yield Static("0 tasks", classes="column-count", id=f"count-{self.status.value}")
 
     @property
@@ -110,9 +122,8 @@ class KanbanColumn(VerticalScroll, can_focus=False):
             card.remove()
         count_widget = self.query_one(f"#count-{self.status.value}", Static)
         count_widget.update(f"{len(tasks)} task{'s' if len(tasks) != 1 else ''}")
-        col_idx = STAGE_ORDER.index(self.status)
         for i, task in enumerate(tasks):
-            card = TaskCard(task, col_idx, i)
+            card = TaskCard(task, self.col_idx, i)
             self.mount(card)
         if self._tasks:
             self._selected = min(self._selected, len(self._tasks) - 1)
@@ -160,6 +171,7 @@ class BoardScreen(Screen):
         self.pipeline = pipeline
         self.registry = registry
         self._config = storage.load_config()
+        self._visible_stages = self._config.active_stages()
         self._active_col: int = 0
         self._columns: list[KanbanColumn] = []
         self._poll_timer = None
@@ -170,9 +182,14 @@ class BoardScreen(Screen):
             id="board-header",
         )
         with Horizontal(id="kanban-board"):
-            for status in STAGE_ORDER:
+            for idx, status in enumerate(self._visible_stages):
                 label = self._config.label_for(status)
-                col = KanbanColumn(status, label)
+                agent_cfg = self._config.agent_for_stage(status) if self._config.stage_config(status) else None
+                col = KanbanColumn(
+                    status, label, col_idx=idx,
+                    agent_name=agent_cfg.name if agent_cfg else "",
+                    model_name=agent_cfg.model or "" if agent_cfg else "",
+                )
                 self._columns.append(col)
                 yield col
         yield Footer()
@@ -238,7 +255,9 @@ class BoardScreen(Screen):
 
     def _follow_task(self, task: Task) -> None:
         """Move active column to where the task is now."""
-        target_col = STAGE_ORDER.index(task.status)
+        if task.status not in self._visible_stages:
+            return
+        target_col = self._visible_stages.index(task.status)
         self._active_col = target_col
         col = self._columns[target_col]
         for i, t in enumerate(col._tasks):
@@ -320,14 +339,17 @@ class BoardScreen(Screen):
         task = self._active_column.selected_task
         if not task:
             return
-        idx = STAGE_ORDER.index(task.status)
-        if idx >= len(STAGE_ORDER) - 1:
+        if task.status == TaskStatus.DONE:
             self.notify("Already at final stage", severity="warning")
             return
         if self.pipeline:
             self._do_advance(task.id)
         else:
-            next_status = STAGE_ORDER[idx + 1]
+            vs = self._visible_stages
+            idx = vs.index(task.status)
+            if idx >= len(vs) - 1:
+                return
+            next_status = vs[idx + 1]
             task.status = next_status
             task.touch()
             self.storage.save_task(task)
@@ -342,18 +364,18 @@ class BoardScreen(Screen):
             if not task:
                 self.notify("Task not found", severity="error")
                 return
-            idx = STAGE_ORDER.index(task.status)
-            if idx >= len(STAGE_ORDER) - 1:
+            if task.status == TaskStatus.DONE:
                 self.notify("Already at final stage", severity="warning")
                 return
-            next_label = self._config.label_for(STAGE_ORDER[idx + 1])
-            self.notify(f"Advancing to {next_label}...")
+            self.notify(f"Advancing {task.title} from {task.status.value}...")
             updated = await self.pipeline.advance(task)
             self._refresh_board()
             self._follow_task(updated)
             self.notify(f"Moved to {self._config.label_for(updated.status)}: {updated.title}")
+        except asyncio.CancelledError:
+            self.notify("Advance cancelled (worker conflict)", severity="warning")
         except Exception as e:
-            self.notify(f"Error: {e}", severity="error", timeout=15)
+            self.notify(f"Advance error: {e}", severity="error", timeout=15)
 
     # --- b: Back (revert) ---
 
@@ -367,8 +389,11 @@ class BoardScreen(Screen):
         if self.pipeline:
             self._do_revert(task.id)
         else:
-            idx = STAGE_ORDER.index(task.status)
-            prev_status = STAGE_ORDER[idx - 1]
+            vs = self._visible_stages
+            idx = vs.index(task.status)
+            if idx <= 0:
+                return
+            prev_status = vs[idx - 1]
             task.status = prev_status
             task.touch()
             self.storage.save_task(task)

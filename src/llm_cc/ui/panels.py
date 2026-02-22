@@ -116,6 +116,8 @@ class AgentPanel(ModalScreen[None]):
     Esc: close panel
     Ctrl+C: send interrupt to agent
     Ctrl+T: toggle text input mode (for typing longer messages)
+    Shift+PageUp/PageDown: scroll output history
+    Shift+End: resume auto-scroll
     """
 
     def __init__(self, session_id: str, backend: object) -> None:
@@ -130,17 +132,34 @@ class AgentPanel(ModalScreen[None]):
             yield Static(f"Agent Session: {self._session_id}", classes="column-header")
             yield VerticalScroll(Static("Loading...", id="agent-output"), id="agent-scroll")
             yield Static(
-                "[dim]All keys go to agent  |  [bold]Ctrl+C[/] interrupt  |  [bold]Ctrl+T[/] text input  |  [bold]Esc[/] close[/]",
+                "[dim]All keys go to agent  |  [bold]Ctrl+C[/] interrupt  |  [bold]Ctrl+T[/] text input  |  [bold]Shift+PgUp/PgDn[/] scroll  |  [bold]Esc[/] close[/]",
                 id="agent-help",
             )
             yield Input(placeholder="Type message, press Enter to send (Esc to exit)...", id="agent-input")
 
     def on_mount(self) -> None:
         self.query_one("#agent-input", Input).display = False
+        # Resize PTY after layout completes (on_mount fires before sizing)
+        self.call_after_refresh(self._resize_pty)
         self._poll_output()
 
     def on_unmount(self) -> None:
         self._polling = False
+
+    def on_resize(self, event) -> None:
+        """Re-fit PTY when terminal/panel is resized."""
+        self._resize_pty()
+
+    def _resize_pty(self) -> None:
+        """Resize the PTY buffer to match the agent output area."""
+        try:
+            scroll = self.query_one("#agent-scroll", VerticalScroll)
+            cols = scroll.size.width - 2  # account for padding
+            rows = scroll.size.height
+            if cols > 0 and rows > 0 and hasattr(self._backend, "resize_session"):
+                self._backend.resize_session(self._session_id, cols, rows)
+        except Exception:
+            pass
 
     async def on_key(self, event) -> None:
         """Forward raw keystrokes to the PTY agent."""
@@ -158,6 +177,31 @@ class AgentPanel(ModalScreen[None]):
         if event.key == "escape":
             self._polling = False
             self.dismiss(None)
+            event.prevent_default()
+            event.stop()
+            return
+
+        # Scroll controls (Shift+PageUp/PageDown/Home/End)
+        if event.key == "shift+pageup":
+            self.query_one("#agent-scroll", VerticalScroll).scroll_page_up(animate=False)
+            event.prevent_default()
+            event.stop()
+            return
+
+        if event.key == "shift+pagedown":
+            self.query_one("#agent-scroll", VerticalScroll).scroll_page_down(animate=False)
+            event.prevent_default()
+            event.stop()
+            return
+
+        if event.key == "shift+home":
+            self.query_one("#agent-scroll", VerticalScroll).scroll_home(animate=False)
+            event.prevent_default()
+            event.stop()
+            return
+
+        if event.key == "shift+end":
+            self.query_one("#agent-scroll", VerticalScroll).scroll_end(animate=False)
             event.prevent_default()
             event.stop()
             return
@@ -207,14 +251,44 @@ class AgentPanel(ModalScreen[None]):
 
     @work(exclusive=True)
     async def _poll_output(self) -> None:
-        """Continuously refresh agent output."""
+        """Continuously refresh agent output with Rich colors and scrollback."""
+        from rich.text import Text
+
         output_widget = self.query_one("#agent-output", Static)
         scroll = self.query_one("#agent-scroll", VerticalScroll)
         while self._polling:
             try:
-                text = await self._backend.get_output(self._session_id)
-                if text:
-                    output_widget.update(text)
+                # Check if user is at/near bottom BEFORE updating content
+                at_bottom = scroll.max_scroll_y <= 0 or scroll.scroll_offset.y >= scroll.max_scroll_y - 2
+
+                # Try rich output first (PtyBackend), fall back to plain text
+                rich_content: Text | None = None
+                history: list[Text] = []
+                if hasattr(self._backend, "get_output_rich"):
+                    rich_content = await self._backend.get_output_rich(self._session_id)
+                    history = await self._backend.get_history_rich(self._session_id)
+
+                if rich_content is not None:
+                    # Combine history + current screen
+                    if history:
+                        combined = Text()
+                        for i, line in enumerate(history):
+                            if i > 0:
+                                combined.append("\n")
+                            combined.append_text(line)
+                        combined.append("\n")
+                        combined.append_text(rich_content)
+                        output_widget.update(combined)
+                    else:
+                        output_widget.update(rich_content)
+                else:
+                    # Fallback for API backend
+                    text = await self._backend.get_output(self._session_id)
+                    if text:
+                        output_widget.update(text)
+
+                # Only auto-scroll if user was at bottom before content update
+                if at_bottom:
                     scroll.scroll_end(animate=False)
             except Exception:
                 break

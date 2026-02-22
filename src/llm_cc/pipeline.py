@@ -49,6 +49,42 @@ class PipelineEngine:
         task.docs_path = str(docs)
         return docs
 
+    def _resolve_plan_path(self, task: Task) -> Path:
+        """Resolve plan directory from config template + task fields.
+
+        Template variables: {id}, {slug}, {branch}, {title}
+        Returns absolute path to the plan file.
+        """
+        template = self.config.project.plan_dir
+        plan_file = self.config.project.plan_file
+
+        if "{branch}" in template and not task.branch_name:
+            raise RuntimeError(
+                f"plan_dir uses {{branch}} but task has no branch. "
+                f"Set git.mode to 'worktree' or 'branch' in config."
+            )
+
+        try:
+            plan_dir = template.format(
+                id=task.id,
+                slug=task.slug(),
+                branch=task.branch_name or "",
+                title=task.title,
+            )
+        except KeyError as e:
+            raise RuntimeError(f"Unknown variable in plan_dir template: {e}")
+
+        if not plan_dir:
+            raise RuntimeError("plan_dir resolved to empty string")
+
+        full_dir = (self.git.project_path / plan_dir).resolve()
+        if not full_dir.is_relative_to(self.git.project_path.resolve()):
+            raise RuntimeError(
+                f"plan_dir resolved outside project: {full_dir}"
+            )
+        full_dir.mkdir(parents=True, exist_ok=True)
+        return full_dir / plan_file
+
     async def advance(self, task: Task) -> Task:
         """Move task to next stage. Orchestrates agents and git."""
         next_status = self._next_status(task.status)
@@ -57,9 +93,9 @@ class PipelineEngine:
 
         # Stop current agent if running
         if task.session_id:
-            # Capture review output to file when leaving REVIEW
-            if task.status == TaskStatus.REVIEW:
-                await self._save_stage_output(task, "review")
+            # Capture output to file when leaving a stage
+            if task.status in (TaskStatus.PLANNING, TaskStatus.REVIEW):
+                await self._save_stage_output(task, task.status.value)
             await self._stop_current_agent(task)
 
         stage = self.config.stage_config(next_status)
@@ -69,20 +105,24 @@ class PipelineEngine:
 
         match next_status:
             case TaskStatus.PLANNING:
-                await self.git.setup(task)
-                prompt = self._build_prompt(task, docs, "planning")
+                await self.git.setup(task)  # sets task.branch_name
+                plan_path = self._resolve_plan_path(task)
+                prompt = self._build_planning_prompt(task, docs, plan_path)
                 backend = self.agents.backend_for(agent_config.name, stage.mode_override if stage else None)
                 task.session_id = await backend.start(agent_config, task, prompt, self.git.project_path, stage="planning", cli_flags=flags)
 
             case TaskStatus.EXECUTE:
-                # No isolation — only one task in Execute at a time
-                if self.config.project.git.mode == GitMode.NONE:
+                # No directory isolation — only one task in Execute at a time
+                if self.config.project.git.mode in (GitMode.NONE, GitMode.BRANCH):
                     store = self.storage.load_tasks()
                     occupied = [t for t in store.by_status(TaskStatus.EXECUTE) if t.id != task.id]
                     if occupied:
                         raise RuntimeError(f"Execute slot occupied by: {occupied[0].title}")
 
-                prompt = self._build_prompt(task, docs, "execute")
+                if not self._has_planning_stage():
+                    await self.git.setup(task)  # git setup here when no planning stage
+                plan_path = self._resolve_plan_path(task)
+                prompt = self._build_execute_prompt(task, docs, plan_path)
                 backend = self.agents.backend_for(agent_config.name, stage.mode_override if stage else None)
                 task.session_id = await backend.start(agent_config, task, prompt, self.git.project_path, stage="execute", cli_flags=flags)
 
@@ -97,7 +137,8 @@ class PipelineEngine:
                     f"## Diff\n```\n{diff or 'No changes yet.'}\n```\n"
                 )
 
-                prompt = self._build_prompt(task, docs, "review")
+                plan_path = self._resolve_plan_path(task)
+                prompt = self._build_review_prompt(task, docs, plan_path)
                 backend = self.agents.backend_for(agent_config.name, stage.mode_override if stage else None)
                 task.session_id = await backend.start(agent_config, task, prompt, self.git.project_path, stage="review", cli_flags=flags)
 
@@ -111,9 +152,9 @@ class PipelineEngine:
         return task
 
     async def revert(self, task: Task) -> Task:
-        """Move task back one stage."""
-        idx = STAGE_ORDER.index(task.status)
-        if idx <= 0:
+        """Move task back one stage, skipping unconfigured stages."""
+        prev = self._prev_status(task.status)
+        if prev is None:
             return task  # already at BACKLOG
 
         # Capture output before stopping
@@ -121,7 +162,7 @@ class PipelineEngine:
             await self._save_stage_output(task, task.status.value)
             await self._stop_current_agent(task)
 
-        task.status = STAGE_ORDER[idx - 1]
+        task.status = prev
         task.touch()
         self.storage.save_task(task)
         return task
@@ -136,6 +177,7 @@ class PipelineEngine:
             await self._stop_current_agent(task)
 
         docs = self._ensure_task_docs(task)
+        plan_path = self._resolve_plan_path(task)
         stage = self.config.stage_config(task.status)
         agent_config = self.config.agent_for_stage(task.status, task)
         backend = self.agents.backend_for(agent_config.name, stage.mode_override if stage else None)
@@ -152,7 +194,14 @@ class PipelineEngine:
                 f"## Diff\n```\n{diff or 'No changes yet.'}\n```\n"
             )
 
-        prompt = self._build_prompt(task, docs, task.status.value)
+        match task.status:
+            case TaskStatus.PLANNING:
+                prompt = self._build_planning_prompt(task, docs, plan_path)
+            case TaskStatus.EXECUTE:
+                prompt = self._build_execute_prompt(task, docs, plan_path)
+            case TaskStatus.REVIEW:
+                prompt = self._build_review_prompt(task, docs, plan_path)
+
         task.session_id = await backend.start(agent_config, task, prompt, self.git.project_path, stage=task.status.value, cli_flags=flags)
 
         task.touch()
@@ -201,21 +250,77 @@ class PipelineEngine:
 
     # --- Prompt Building ---
 
-    def _build_prompt(self, task: Task, docs: Path, stage: str) -> str:
-        """Minimal prompt: task + docs path + completion marker.
+    def _plan_rel(self, plan_path: Path) -> str:
+        """Get plan file path relative to project root."""
+        return str(plan_path.relative_to(self.git.project_path))
 
-        All context lives in files under the task docs directory.
-        The agent reads what it needs.
-        """
-        docs_rel = docs.relative_to(self.git.project_path)
+    def _docs_rel(self, docs: Path) -> str:
+        """Get docs dir path relative to project root."""
+        return str(docs.relative_to(self.git.project_path))
+
+    def _build_planning_prompt(self, task: Task, docs: Path, plan_path: Path) -> str:
+        docs_rel = self._docs_rel(docs)
+        plan_rel = self._plan_rel(plan_path)
         return (
-            f"{stage.upper()}: {task.title}\n\n"
-            f"Task docs: {docs_rel}/\n"
-            f"Read {docs_rel}/task.md for the task description.\n\n"
-            f"When finished, say: {stage.upper()} COMPLETE"
+            f"PLANNING: {task.title}\n\n"
+            f"Task description: {docs_rel}/task.md\n"
+            f"Write your plan to: {plan_rel}\n\n"
+            f"When finished, say: PLANNING COMPLETE"
         )
 
-    @staticmethod
-    def _next_status(current: TaskStatus) -> TaskStatus | None:
+    def _build_execute_prompt(self, task: Task, docs: Path, plan_path: Path) -> str:
+        docs_rel = self._docs_rel(docs)
+        plan_rel = self._plan_rel(plan_path)
+        return (
+            f"EXECUTE: {task.title}\n\n"
+            f"Task description: {docs_rel}/task.md\n"
+            f"Plan: {plan_rel}\n\n"
+            f"When finished, say: EXECUTE COMPLETE"
+        )
+
+    def _build_review_prompt(self, task: Task, docs: Path, plan_path: Path) -> str:
+        docs_rel = self._docs_rel(docs)
+        plan_rel = self._plan_rel(plan_path)
+        review_hint = ""
+        if self.config.project.review_file:
+            review_path = plan_path.parent / self.config.project.review_file
+            review_rel = str(review_path.relative_to(self.git.project_path))
+            review_hint = f"Write your review to: {review_rel}\n"
+        return (
+            f"REVIEW: {task.title}\n\n"
+            f"Task description: {docs_rel}/task.md\n"
+            f"Plan: {plan_rel}\n"
+            f"Diff: {docs_rel}/diff.md\n"
+            f"{review_hint}\n"
+            f"When finished, say: REVIEW COMPLETE"
+        )
+
+    def _has_planning_stage(self) -> bool:
+        return TaskStatus.PLANNING in self._configured_stages()
+
+    def _configured_stages(self) -> set[TaskStatus]:
+        return {s.stage for s in self.config.pipeline}
+
+    def _is_active(self, status: TaskStatus) -> bool:
+        """True if this stage is in the pipeline (or is BACKLOG/DONE)."""
+        return status in (TaskStatus.BACKLOG, TaskStatus.DONE) or status in self._configured_stages()
+
+    def _next_status(self, current: TaskStatus) -> TaskStatus | None:
+        """Next stage, skipping stages not in [[pipeline]] config.
+
+        BACKLOG and DONE are always present. PLANNING, EXECUTE, REVIEW
+        only appear if they have a [[pipeline]] entry.
+        """
         idx = STAGE_ORDER.index(current)
-        return STAGE_ORDER[idx + 1] if idx < len(STAGE_ORDER) - 1 else None
+        for i in range(idx + 1, len(STAGE_ORDER)):
+            if self._is_active(STAGE_ORDER[i]):
+                return STAGE_ORDER[i]
+        return None
+
+    def _prev_status(self, current: TaskStatus) -> TaskStatus | None:
+        """Previous stage, skipping unconfigured stages."""
+        idx = STAGE_ORDER.index(current)
+        for i in range(idx - 1, -1, -1):
+            if self._is_active(STAGE_ORDER[i]):
+                return STAGE_ORDER[i]
+        return None
