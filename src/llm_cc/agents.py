@@ -70,7 +70,6 @@ class OutputBuffer:
         self._log_file = None
         self._last_content: str = ""
         self._stable_ticks: int = 0  # how many polls the screen hasn't changed
-        self._was_waiting: bool = False  # hysteresis: stay waiting until content truly changes
         if log_path:
             log_path.parent.mkdir(parents=True, exist_ok=True)
             self._log_file = open(log_path, "a")
@@ -213,27 +212,12 @@ class OutputBuffer:
         Triggers when the visible screen content hasn't changed for ~0.3s
         AND the screen matches known input prompt patterns.
         Searches full screen since CLI prompts can render anywhere.
-
-        Hysteresis: once waiting is detected, stays waiting even through
-        brief screen redraws (cursor repositioning, selection highlight).
-        Only clears when patterns stop matching after sustained change.
+        The board's 2-second poll interval naturally debounces brief flickers.
         """
+        if self._stable_ticks < 3:
+            return False
         screen_text = self.display().lower()
-        has_pattern = any(p in screen_text for p in _INPUT_PATTERNS)
-
-        if self._stable_ticks >= 3 and has_pattern:
-            self._was_waiting = True
-            return True
-
-        if self._was_waiting:
-            # Stay waiting through brief redraws — only clear after
-            # sustained change (10+ ticks = ~1s) or patterns disappear
-            if not has_pattern and self._stable_ticks >= 10:
-                self._was_waiting = False
-                return False
-            return True
-
-        return False
+        return any(p in screen_text for p in _INPUT_PATTERNS)
 
     def close(self) -> None:
         """Close log file if open."""
