@@ -106,10 +106,16 @@ class PipelineEngine:
         match next_status:
             case TaskStatus.PLANNING:
                 await self.git.setup(task)  # sets task.branch_name
-                plan_path = self._resolve_plan_path(task)
-                prompt = self._build_planning_prompt(task, docs, plan_path)
-                backend = self.agents.backend_for(agent_config.name, stage.mode_override if stage else None)
-                task.session_id = await backend.start(agent_config, task, prompt, self.git.project_path, stage="planning", cli_flags=flags)
+                if stage and stage.is_brainstorm:
+                    task.sub_agent_idx = 0
+                    task.loop_count = 0
+                    task.brainstorm_summarizing = False
+                    await self._spawn_brainstorm_agent(task, stage, docs)
+                else:
+                    plan_path = self._resolve_plan_path(task)
+                    prompt = self._build_planning_prompt(task, docs, plan_path)
+                    backend = self.agents.backend_for(agent_config.name, stage.mode_override if stage else None)
+                    task.session_id = await backend.start(agent_config, task, prompt, self.git.project_path, stage="planning", cli_flags=flags)
 
             case TaskStatus.EXECUTE:
                 # No directory isolation — only one task in Execute at a time
@@ -121,10 +127,16 @@ class PipelineEngine:
 
                 if not self._has_planning_stage():
                     await self.git.setup(task)  # git setup here when no planning stage
-                plan_path = self._resolve_plan_path(task)
-                prompt = self._build_execute_prompt(task, docs, plan_path)
-                backend = self.agents.backend_for(agent_config.name, stage.mode_override if stage else None)
-                task.session_id = await backend.start(agent_config, task, prompt, self.git.project_path, stage="execute", cli_flags=flags)
+                if stage and stage.is_brainstorm:
+                    task.sub_agent_idx = 0
+                    task.loop_count = 0
+                    task.brainstorm_summarizing = False
+                    await self._spawn_brainstorm_agent(task, stage, docs)
+                else:
+                    plan_path = self._resolve_plan_path(task)
+                    prompt = self._build_execute_prompt(task, docs, plan_path)
+                    backend = self.agents.backend_for(agent_config.name, stage.mode_override if stage else None)
+                    task.session_id = await backend.start(agent_config, task, prompt, self.git.project_path, stage="execute", cli_flags=flags)
 
             case TaskStatus.REVIEW:
                 # Write diff to docs for the review agent to read
@@ -137,10 +149,16 @@ class PipelineEngine:
                     f"## Diff\n```\n{diff or 'No changes yet.'}\n```\n"
                 )
 
-                plan_path = self._resolve_plan_path(task)
-                prompt = self._build_review_prompt(task, docs, plan_path)
-                backend = self.agents.backend_for(agent_config.name, stage.mode_override if stage else None)
-                task.session_id = await backend.start(agent_config, task, prompt, self.git.project_path, stage="review", cli_flags=flags)
+                if stage and stage.is_brainstorm:
+                    task.sub_agent_idx = 0
+                    task.loop_count = 0
+                    task.brainstorm_summarizing = False
+                    await self._spawn_brainstorm_agent(task, stage, docs)
+                else:
+                    plan_path = self._resolve_plan_path(task)
+                    prompt = self._build_review_prompt(task, docs, plan_path)
+                    backend = self.agents.backend_for(agent_config.name, stage.mode_override if stage else None)
+                    task.session_id = await backend.start(agent_config, task, prompt, self.git.project_path, stage="review", cli_flags=flags)
 
             case TaskStatus.DONE:
                 task.session_id = None
@@ -161,6 +179,11 @@ class PipelineEngine:
         if task.session_id:
             await self._save_stage_output(task, task.status.value)
             await self._stop_current_agent(task)
+
+        # Reset brainstorm counters
+        task.sub_agent_idx = 0
+        task.loop_count = 0
+        task.brainstorm_summarizing = False
 
         task.status = prev
         task.touch()
@@ -247,6 +270,188 @@ class PipelineEngine:
                 out_file.write_text(output)
         except Exception:
             pass
+
+    # --- Brainstorm ---
+
+    def is_brainstorm_stage(self, task: Task) -> bool:
+        """True if task is on a stage with multiple agents (brainstorm)."""
+        stage = self.config.stage_config(task.status)
+        return stage is not None and stage.is_brainstorm
+
+    async def advance_sub_agent(self, task: Task) -> bool:
+        """Advance to next sub-agent within a brainstorm stage.
+
+        Returns True if brainstorm is complete (all loops + summary done).
+        """
+        stage = self.config.stage_config(task.status)
+        if not stage or not stage.is_brainstorm:
+            return True
+
+        # Summarizer just finished — brainstorm complete
+        if task.brainstorm_summarizing:
+            await self._stop_current_agent(task)
+            task.brainstorm_summarizing = False
+            task.sub_agent_idx = 0
+            task.loop_count = 0
+            task.session_id = None
+            task.touch()
+            self.storage.save_task(task)
+            return True
+
+        # Save current sub-agent output
+        agent_name = stage.agent_at(task.sub_agent_idx)
+        await self._save_brainstorm_output(task, agent_name, task.loop_count)
+        await self._stop_current_agent(task)
+
+        # Advance to next sub-agent
+        task.sub_agent_idx += 1
+        if task.sub_agent_idx >= len(stage.agents):
+            # Finished all agents in this cycle
+            task.loop_count += 1
+            task.sub_agent_idx = 0
+            if task.loop_count >= stage.max_loops:
+                # All cycles done — spawn summarizer
+                if stage.summarizer and stage.summarizer in self.config.agents:
+                    await self._spawn_brainstorm_summarizer(task, stage)
+                    task.touch()
+                    self.storage.save_task(task)
+                    return False
+                # No summarizer configured — done
+                task.sub_agent_idx = 0
+                task.loop_count = 0
+                task.session_id = None
+                task.touch()
+                self.storage.save_task(task)
+                return True
+
+        # Spawn next sub-agent
+        docs = self._task_docs_dir(task)
+        await self._spawn_brainstorm_agent(task, stage, docs)
+        task.touch()
+        self.storage.save_task(task)
+        return False
+
+    async def _spawn_brainstorm_agent(self, task: Task, stage, docs: Path) -> None:
+        """Spawn the current brainstorm sub-agent."""
+        agent_name = stage.agent_at(task.sub_agent_idx)
+        agent_config = self.config.agents[agent_name]
+        prompt = self._build_brainstorm_prompt(task, agent_name, stage, docs)
+        backend = self.agents.backend_for(agent_config.name, stage.mode_override)
+        session_stage = f"{stage.stage.value}_{agent_name}_c{task.loop_count}"
+        task.session_id = await backend.start(
+            agent_config, task, prompt, self.git.project_path,
+            stage=session_stage, cli_flags=stage.cli_flags,
+        )
+
+    async def _save_brainstorm_output(self, task: Task, agent_name: str, cycle: int) -> None:
+        """Save brainstorm sub-agent output to {agent}-cycle{N}.md.
+
+        If the agent already wrote the file (preferred), skip terminal capture.
+        """
+        docs = self._task_docs_dir(task)
+        out_file = docs / f"{agent_name}-cycle{cycle + 1}.md"
+        if out_file.exists() and out_file.stat().st_size > 0:
+            return  # Agent wrote it directly — clean output
+        if not task.session_id:
+            return
+        try:
+            agent_config = self.config.agent_for_stage(task.status, task)
+            backend = self.agents.backend_for(agent_config.name)
+            output = await backend.get_output(task.session_id)
+            if output:
+                out_file.write_text(output)
+        except Exception:
+            pass
+
+    async def _spawn_brainstorm_summarizer(self, task: Task, stage) -> None:
+        """Spawn the summarizer agent after all brainstorm loops."""
+        task.brainstorm_summarizing = True
+        agent_config = self.config.agents[stage.summarizer]
+        docs = self._task_docs_dir(task)
+        summary_dir = self.git.project_path / "brainstorm" / task.id
+        summary_dir.mkdir(parents=True, exist_ok=True)
+        prompt = self._build_summary_prompt(task, stage, docs, summary_dir)
+        backend = self.agents.backend_for(agent_config.name, stage.mode_override)
+        session_stage = f"{stage.stage.value}_summarizer"
+        task.session_id = await backend.start(
+            agent_config, task, prompt, self.git.project_path,
+            stage=session_stage, cli_flags=stage.cli_flags,
+        )
+
+    def _build_summary_prompt(self, task: Task, stage, docs: Path, summary_dir: Path) -> str:
+        """Build prompt for the brainstorm summarizer."""
+        docs_rel = self._docs_rel(docs)
+        summary_rel = str(summary_dir.relative_to(self.git.project_path))
+
+        cycle_files = sorted(
+            f.name for f in docs.glob("*-cycle*.md")
+        )
+
+        lines = [
+            f"BRAINSTORM SUMMARY: {task.title}",
+            f"You are the summarizer. All brainstorm cycles are complete.",
+            f"Participants were: {', '.join(stage.agents)}",
+            f"Total cycles: {stage.max_loops}",
+            "",
+            f"Task: {docs_rel}/task.md",
+            "",
+            "Discussion logs (read all of these):",
+        ]
+        for f in cycle_files:
+            lines.append(f"  - {docs_rel}/{f}")
+
+        lines.extend([
+            "",
+            f"Write your summary to: {summary_rel}/summary.md",
+            "",
+            "Your summary MUST include:",
+            "1. Executive Summary — key conclusions in 3-5 bullets",
+            "2. Points of Agreement — what strategist and critic converged on",
+            "3. Points of Tension — unresolved disagreements or tradeoffs",
+            "4. Recommended Actions — concrete next steps",
+            "",
+            "Also copy the discussion logs to the summary folder:",
+        ])
+        for f in cycle_files:
+            lines.append(f"  - Copy {docs_rel}/{f} to {summary_rel}/{f}")
+
+        return "\n".join(lines)
+
+    def _build_brainstorm_prompt(self, task: Task, agent_name: str, stage, docs: Path) -> str:
+        """Build prompt for a brainstorm sub-agent with cycle context."""
+        docs_rel = self._docs_rel(docs)
+        cycle = task.loop_count + 1  # 1-based for display
+        total = stage.max_loops
+
+        existing = sorted(
+            f.name for f in docs.glob("*.md")
+            if f.name != "task.md"
+        )
+
+        lines = [
+            f"BRAINSTORM: {task.title}",
+            f"Your role: {agent_name}",
+            f"Cycle: {cycle}/{total}",
+            f"Participants: {', '.join(stage.agents)}",
+            "",
+            f"Task: {docs_rel}/task.md",
+        ]
+
+        if existing:
+            lines.append("")
+            lines.append("Previous outputs (read these files):")
+            for f in existing:
+                lines.append(f"  - {docs_rel}/{f}")
+
+        if cycle == total:
+            lines.append("")
+            lines.append("FINAL CYCLE. Converge on actionable conclusions.")
+
+        out_file = f"{docs_rel}/{agent_name}-cycle{cycle}.md"
+        lines.append("")
+        lines.append(f"Write your analysis to: {out_file}")
+        lines.append("Do NOT use Read tool on previous output files — use cat or just reference them.")
+        return "\n".join(lines)
 
     # --- Prompt Building ---
 

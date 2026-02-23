@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 # --- Task ---
@@ -35,6 +35,9 @@ class Task(BaseModel):
     pr_number: int | None = None
     pr_url: str | None = None
     docs_path: str | None = None  # .llm-cc/tasks/<id>/ — shared docs between stages
+    sub_agent_idx: int = 0    # brainstorm: index into stage.agents
+    loop_count: int = 0       # brainstorm: current cycle (0-based)
+    brainstorm_summarizing: bool = False  # brainstorm: in final summary phase
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -108,11 +111,30 @@ class AgentConfig(BaseModel):
 
 class PipelineStage(BaseModel):
     stage: TaskStatus
-    agent: str
+    agent: str = ""
+    agents: list[str] = []                # sequential sub-agents for brainstorm
+    max_loops: int = 1                    # how many full cycles through agents list
+    summarizer: str = ""                  # agent that writes final summary after all loops
     mode_override: AgentMode | None = None
     prompt_template: str | None = None
     cli_flags: str = ""  # extra CLI flags for this stage (e.g. "--dangerously-skip-permissions")
     auto: bool = False
+
+    @model_validator(mode="after")
+    def _check_agent_or_agents(self) -> PipelineStage:
+        if not self.agent and not self.agents:
+            raise ValueError("PipelineStage needs 'agent' or 'agents'")
+        return self
+
+    @property
+    def is_brainstorm(self) -> bool:
+        return len(self.agents) > 0
+
+    def agent_at(self, sub_idx: int = 0) -> str:
+        """Resolve agent name by index. For brainstorm, wraps around agents list."""
+        if self.agents:
+            return self.agents[sub_idx % len(self.agents)]
+        return self.agent
 
 
 # --- Git Config ---
@@ -167,8 +189,10 @@ class MergedConfig(BaseModel):
             return self.agents[task.agent_override]
         for stage in self.pipeline:
             if stage.stage == status:
-                if stage.agent in self.agents:
-                    return self.agents[stage.agent]
+                idx = task.sub_agent_idx if task else 0
+                agent_name = stage.agent_at(idx)
+                if agent_name in self.agents:
+                    return self.agents[agent_name]
                 break
         default_name = self.global_cfg.default_agent
         if default_name in self.agents:

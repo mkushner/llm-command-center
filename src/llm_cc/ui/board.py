@@ -203,29 +203,49 @@ class BoardScreen(Screen):
             self._poll_timer.stop()
 
     def _poll_agent_status(self) -> None:
-        """Check if any active agents are waiting for user input."""
+        """Check active agents: auto-advance brainstorm sub-agents, detect input waits."""
         if not self.registry:
             return
         changed = False
         for col in self._columns:
             for card in col.query(TaskCard):
                 task = card.task_data
-                if task.session_id:
-                    try:
-                        agent_config = self._config.agent_for_stage(task.status, task)
-                        backend = self.registry.backend_for(agent_config.name)
-                        waiting = (
-                            isinstance(backend, PtyBackend)
-                            and backend.is_waiting_for_input(task.session_id)
-                        )
-                    except Exception:
-                        waiting = False
-                    if card.waiting_for_input != waiting:
-                        card.waiting_for_input = waiting
+                if not task.session_id:
+                    if card.waiting_for_input:
+                        card.waiting_for_input = False
                         changed = True
-                elif card.waiting_for_input:
-                    card.waiting_for_input = False
+                    continue
+
+                try:
+                    agent_config = self._config.agent_for_stage(task.status, task)
+                    backend = self.registry.backend_for(agent_config.name)
+                except Exception:
+                    continue
+
+                # Auto-advance brainstorm sub-agents when process exits or goes idle
+                if (
+                    self.pipeline
+                    and self.pipeline.is_brainstorm_stage(task)
+                ):
+                    dead = not backend.is_alive(task.session_id)
+                    idle = (
+                        isinstance(backend, PtyBackend)
+                        and backend.is_waiting_for_input(task.session_id)
+                    )
+                    if dead or idle:
+                        self._do_brainstorm_advance(task.id)
+                        changed = True
+                        continue
+
+                # Existing: detect permission/input prompts
+                waiting = (
+                    isinstance(backend, PtyBackend)
+                    and backend.is_waiting_for_input(task.session_id)
+                )
+                if card.waiting_for_input != waiting:
+                    card.waiting_for_input = waiting
                     changed = True
+
         if changed:
             self._update_column_focus()
 
@@ -442,6 +462,30 @@ class BoardScreen(Screen):
             self.notify(f"Restarted {label}: {updated.title}")
         except Exception as e:
             self.notify(f"Error: {e}", severity="error", timeout=15)
+
+    # --- Brainstorm auto-advance ---
+
+    @work(exclusive=True, group="brainstorm")
+    async def _do_brainstorm_advance(self, task_id: str) -> None:
+        try:
+            task = self._fresh_task(task_id)
+            if not task:
+                return
+            done = await self.pipeline.advance_sub_agent(task)
+            self._refresh_board()
+            if done:
+                self.notify(f"Brainstorm complete: {task.title}")
+            else:
+                if task.brainstorm_summarizing:
+                    self.notify(f"Brainstorm: summarizing {task.title}")
+                else:
+                    stage = self._config.stage_config(task.status)
+                    if stage:
+                        agent_name = stage.agent_at(task.sub_agent_idx)
+                        cycle = task.loop_count + 1
+                        self.notify(f"Brainstorm: {agent_name} (cycle {cycle}/{stage.max_loops})")
+        except Exception as e:
+            self.notify(f"Brainstorm error: {e}", severity="error")
 
     # --- Other actions ---
 

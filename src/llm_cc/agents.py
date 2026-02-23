@@ -279,6 +279,9 @@ class PtyBackend:
             except OSError:
                 cols, rows = 120, 40
 
+        # Clean env: allow nested Claude sessions from TUI
+        spawn_env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+
         # Spawn in PTY
         child = pexpect.spawn(
             full_cmd,
@@ -286,6 +289,7 @@ class PtyBackend:
             encoding="utf-8",
             timeout=None,
             dimensions=(rows, cols),
+            env=spawn_env,
         )
 
         self._sessions[session_id] = child
