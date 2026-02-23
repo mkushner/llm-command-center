@@ -172,6 +172,41 @@ When `review_file` is set, the review prompt includes a hint: `Write your review
 
 If the PLANNING stage is skipped (no `[[pipeline]]` entry), git workspace setup happens at EXECUTE instead. The execute agent creates the plan itself (e.g., via CLAUDE.md rules) and the review agent still gets the plan path reference.
 
+### Brainstorm mode
+
+A pipeline stage can run multiple agents in sequence through multiple cycles. Instead of one agent per stage, you define a list of agents that take turns, then a summarizer consolidates the output.
+
+```toml
+[agents.strategist]
+command = "claude"
+
+[agents.critic]
+command = "claude"
+
+[agents.summarizer]
+command = "claude"
+
+[[pipeline]]
+stage = "planning"
+agents = ["strategist", "critic"]   # run these agents in sequence
+max_loops = 2                       # repeat the sequence 2 times
+summarizer = "summarizer"           # final agent writes summary
+```
+
+Flow: strategist → critic → strategist → critic → summarizer → STALE
+
+Each sub-agent writes its output to `.llm-cc/tasks/<id>/{agent}-cycle{N}.md`. The next agent's prompt includes references to all previous outputs. Auto-advance happens within the stage — the board poll detects when a sub-agent goes idle and spawns the next one.
+
+After all loops, the summarizer agent reads all cycle outputs and writes a structured summary to `brainstorm/<task-id>/summary.md` in the project root, containing:
+- Executive summary
+- Points of agreement
+- Points of tension
+- Recommended actions
+
+The card shows STALE when brainstorm is complete — you then manually advance to the next stage.
+
+Use `agents` (list) instead of `agent` (string) to enable brainstorm. Both `max_loops` (default: 1) and `summarizer` (optional) are brainstorm-only fields. Stages without `agents` work exactly as before.
+
 ### Agent resolution
 
 When a task enters a stage, the agent is resolved in order:
@@ -355,7 +390,7 @@ pyte is a full terminal emulator. Feed it raw PTY output, get a character grid b
 - File locking via `fcntl.flock()` (POSIX) prevents corruption
 - Task count is small (tens, not thousands) — no indexing needed
 
-### Why no auto-advance
+### Why no auto-advance (between stages)
 
 Earlier versions auto-advanced Execute→Review when the agent exited. Problems:
 
@@ -363,7 +398,9 @@ Earlier versions auto-advanced Execute→Review when the agent exited. Problems:
 2. Review agent starting immediately prevents user from inspecting execute results
 3. Removes user agency over the workflow
 
-All transitions are now manual. The WAITING FOR INPUT indicator tells you when the agent is idle. You decide what happens next.
+Stage-to-stage transitions are manual. The WAITING FOR INPUT indicator tells you when the agent is idle. You decide what happens next.
+
+**Exception: brainstorm mode** auto-advances *within* a stage — sub-agents cycle automatically because they're part of one logical step. The final stage transition (brainstorm stage → next stage) is still manual.
 
 ### Why no `--dangerously-skip-permissions`
 
@@ -401,6 +438,9 @@ class Task(BaseModel):
     pr_number: int | None
     pr_url: str | None
     docs_path: str | None            # .llm-cc/tasks/<id>/ — shared docs between stages
+    sub_agent_idx: int               # brainstorm: current index into stage.agents
+    loop_count: int                  # brainstorm: current cycle (0-based)
+    brainstorm_summarizing: bool     # brainstorm: in final summary phase
     created_at: datetime
     updated_at: datetime
 ```
@@ -426,12 +466,17 @@ class AgentConfig(BaseModel):
 ```python
 class PipelineStage(BaseModel):
     stage: TaskStatus                # which stage this config applies to
-    agent: str                       # agent name from [agents.*]
+    agent: str                       # agent name from [agents.*] (single-agent mode)
+    agents: list[str]                # sequential sub-agents (brainstorm mode)
+    max_loops: int                   # brainstorm: number of full cycles through agents list
+    summarizer: str                  # brainstorm: agent that writes final summary
     mode_override: AgentMode | None  # override agent's default mode
     prompt_template: str | None      # custom prompt (future)
     cli_flags: str                   # extra CLI flags
     auto: bool                       # auto-run without user trigger (future)
 ```
+
+Either `agent` or `agents` must be set (`agents` enables brainstorm mode).
 
 ### Project config
 
@@ -688,6 +733,10 @@ openai>=1.60       # API backend
 │   └── pty_<id>_<stage>.log
 └── worktrees/               # git worktrees (if git.mode = "worktree")
     └── <id>-<slug>/
+
+<project>/brainstorm/
+└── <task-id>/
+    └── summary.md               # brainstorm summary (written by summarizer agent)
 ```
 
 Add `.llm-cc` to your global gitignore (check `git config --global core.excludesFile` for your file location):

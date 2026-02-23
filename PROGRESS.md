@@ -124,6 +124,21 @@
 - [x] Dynamic PTY sizing: pyte buffer + pexpect dimensions match real terminal, resize on panel open/terminal resize
 - [x] Backend API: `get_output_rich()`, `get_history_rich()`, `resize_session()` on PtyBackend
 
+## Phase 13: Brainstorm Mode — COMPLETE
+
+- [x] PipelineStage: `agents` list, `max_loops`, `summarizer`, `is_brainstorm` property, `agent_at()` method, `model_validator` requiring `agent` or `agents`
+- [x] Task: `sub_agent_idx`, `loop_count`, `brainstorm_summarizing` fields
+- [x] `agent_for_stage()`: resolves sub-agent via `stage.agent_at(task.sub_agent_idx)`
+- [x] Pipeline brainstorm logic: `advance_sub_agent()`, `_spawn_brainstorm_agent()`, `_save_brainstorm_output()`, `_build_brainstorm_prompt()`
+- [x] Brainstorm prompt: includes role, cycle info, participants, previous output references, FINAL CYCLE marker
+- [x] Summarizer: `_spawn_brainstorm_summarizer()`, `_build_summary_prompt()` — writes to `brainstorm/<task-id>/summary.md`
+- [x] Board auto-advance: `_poll_agent_status()` detects dead/idle brainstorm sub-agents, `_do_brainstorm_advance()` worker
+- [x] Revert resets brainstorm counters (`sub_agent_idx`, `loop_count`, `brainstorm_summarizing`)
+- [x] PTY env fix: strip `CLAUDECODE` from spawn environment (allows nested Claude sessions)
+- [x] Idle detection for auto-advance: checks `is_waiting_for_input()` in addition to `is_alive()`
+- [x] Clean output capture: agents write output files directly, PTY capture as fallback only
+- [x] Tests: `test_brainstorm_models.py` (7 tests), `test_brainstorm_pipeline.py` (8 tests), `test_brainstorm_board.py` (1 test)
+
 ---
 
 ## Remaining
