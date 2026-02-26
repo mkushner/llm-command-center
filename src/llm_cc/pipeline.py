@@ -139,16 +139,6 @@ class PipelineEngine:
                     task.session_id = await backend.start(agent_config, task, prompt, self.git.project_path, stage="execute", cli_flags=flags)
 
             case TaskStatus.REVIEW:
-                # Write diff to docs for the review agent to read
-                diff = await self.git.diff_from_base(task)
-                changed = await self.git.changed_files(task)
-                diff_md = docs / "diff.md"
-                diff_md.write_text(
-                    f"# Changes for: {task.title}\n\n"
-                    f"## Changed Files\n{chr(10).join(changed) or 'None'}\n\n"
-                    f"## Diff\n```\n{diff or 'No changes yet.'}\n```\n"
-                )
-
                 if stage and stage.is_brainstorm:
                     task.sub_agent_idx = 0
                     task.loop_count = 0
@@ -205,17 +195,6 @@ class PipelineEngine:
         agent_config = self.config.agent_for_stage(task.status, task)
         backend = self.agents.backend_for(agent_config.name, stage.mode_override if stage else None)
         flags = stage.cli_flags if stage else ""
-
-        # Re-generate diff for review restarts
-        if task.status == TaskStatus.REVIEW:
-            diff = await self.git.diff_from_base(task)
-            changed = await self.git.changed_files(task)
-            diff_md = docs / "diff.md"
-            diff_md.write_text(
-                f"# Changes for: {task.title}\n\n"
-                f"## Changed Files\n{chr(10).join(changed) or 'None'}\n\n"
-                f"## Diff\n```\n{diff or 'No changes yet.'}\n```\n"
-            )
 
         match task.status:
             case TaskStatus.PLANNING:
@@ -519,7 +498,6 @@ class PipelineEngine:
             "",
             f"Task description: {docs_rel}/task.md",
             f"Plan: {plan_rel}",
-            f"Diff: {docs_rel}/diff.md",
         ]
         if review_hint:
             lines.append(review_hint.rstrip())
