@@ -44,7 +44,7 @@ async def test_full_flow():
         storage.save_task(Task(id="aaa", title="Task A", description="First task"))
         storage.save_task(Task(id="bbb", title="Task B", description="Second task"))
         storage.save_task(
-            Task(id="ccc", title="Task C", status=TaskStatus.CODING, description="In progress")
+            Task(id="ccc", title="Task C", status=TaskStatus.EXECUTE, description="In progress")
         )
 
         app = CommandCenterApp(project_path=project)
@@ -102,12 +102,12 @@ async def test_full_flow():
             else:
                 print(f"    Advance stayed at {task_a.status.value} (pipeline may have errored)")
 
-            # --- Test 4: Advance again (Planning -> Coding) ---
+            # --- Test 4: Advance again (Planning -> Execute) ---
             # Navigate to planning column first
             if task_a.status == TaskStatus.PLANNING:
                 await pilot.press("l")  # go to planning column
                 await pilot.pause()
-                await pilot.press("m")  # advance to coding
+                await pilot.press("m")  # advance to execute
                 await pilot.pause()
                 await asyncio.sleep(1.5)
 
@@ -118,7 +118,7 @@ async def test_full_flow():
                 print("[6] Skipped (task didn't advance to planning)")
 
             # --- Test 5: Revert task ---
-            if task_a.status in (TaskStatus.CODING, TaskStatus.PLANNING):
+            if task_a.status in (TaskStatus.EXECUTE, TaskStatus.PLANNING):
                 await pilot.press("r")
                 await pilot.pause()
                 await asyncio.sleep(1.0)

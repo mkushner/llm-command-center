@@ -38,6 +38,18 @@ class TaskInputDialog(ModalScreen[Task | None]):
                 (self._editing.description or "") if self._editing else "",
                 id="task-desc",
             )
+            yield Label("Verify (optional):")
+            yield Input(
+                value=(self._editing.verify or "") if self._editing else "",
+                placeholder="How to verify completion (e.g., 'curl returns 200')",
+                id="task-verify",
+            )
+            yield Label("Done when (optional):")
+            yield Input(
+                value=(self._editing.done or "") if self._editing else "",
+                placeholder="Definition of done (e.g., 'login works with valid/invalid creds')",
+                id="task-done",
+            )
             yield Button("Save", variant="primary", id="save-btn")
 
     def on_mount(self) -> None:
@@ -57,14 +69,18 @@ class TaskInputDialog(ModalScreen[Task | None]):
             self.notify("Title is required", severity="error")
             return
         desc = self.query_one("#task-desc", TextArea).text.strip() or None
+        verify = self.query_one("#task-verify", Input).value.strip() or None
+        done = self.query_one("#task-done", Input).value.strip() or None
 
         if self._editing:
             self._editing.title = title
             self._editing.description = desc
+            self._editing.verify = verify
+            self._editing.done = done
             self._editing.touch()
             self.dismiss(self._editing)
         else:
-            task = Task(title=title, description=desc)
+            task = Task(title=title, description=desc, verify=verify, done=done)
             self.dismiss(task)
 
     def action_cancel(self) -> None:

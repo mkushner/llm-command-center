@@ -25,7 +25,10 @@ class CommandCenterApp(App):
         self.project_path = project_path
         self.storage = Storage(project_path)
         self._config = self.storage.load_config()
-        self.registry = AgentRegistry(self._config.agents)
+        self.registry = AgentRegistry(
+            self._config.agents,
+            sessions_dir=project_path / ".llm-cc" / "sessions",
+        )
 
         self.git = GitWorkspace(project_path, self._config.project.git)
         self.pipeline = PipelineEngine(
@@ -57,4 +60,6 @@ class CommandCenterApp(App):
             self.storage.save_tasks(store)
 
     async def on_unmount(self) -> None:
+        if self.registry.session_store:
+            self.registry.session_store.flush_all()
         await self.registry.cleanup_all()

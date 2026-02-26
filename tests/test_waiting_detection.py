@@ -93,3 +93,53 @@ def test_re_enters_waiting_on_next_prompt():
     buf.append("Press enter to confirm\r\n")
     _tick(buf, 5)
     assert buf.appears_waiting
+
+
+# --- Stage completion vs waiting ---
+
+
+def test_stage_complete_detected():
+    """EXECUTE COMPLETE triggers stage_complete, not waiting."""
+    buf = OutputBuffer()
+    buf.append("All done.\r\nEXECUTE COMPLETE\r\n")
+    _tick(buf, 5)
+    assert buf.appears_stage_complete
+    assert not buf.appears_waiting
+
+
+def test_planning_complete_detected():
+    buf = OutputBuffer()
+    buf.append("PLANNING COMPLETE\r\n")
+    _tick(buf, 5)
+    assert buf.appears_stage_complete
+    assert not buf.appears_waiting
+
+
+def test_review_complete_detected():
+    buf = OutputBuffer()
+    buf.append("REVIEW COMPLETE\r\n")
+    _tick(buf, 5)
+    assert buf.appears_stage_complete
+    assert not buf.appears_waiting
+
+
+def test_stage_complete_not_triggered_during_active_output():
+    """Screen changing → no stage complete even if marker text appears."""
+    buf = OutputBuffer()
+    for i in range(10):
+        buf.append(f"line {i} execute complete check\r\n")
+        _tick(buf)
+    assert not buf.appears_stage_complete
+
+
+def test_stage_complete_clears_when_new_output():
+    """After stage complete, new output clears the flag."""
+    buf = OutputBuffer()
+    buf.append("EXECUTE COMPLETE\r\n")
+    _tick(buf, 5)
+    assert buf.appears_stage_complete
+
+    # Agent resumes (user typed something)
+    buf.append("Starting new work...\r\n")
+    _tick(buf)
+    assert not buf.appears_stage_complete

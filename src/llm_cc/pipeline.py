@@ -225,6 +225,12 @@ class PipelineEngine:
             case TaskStatus.REVIEW:
                 prompt = self._build_review_prompt(task, docs, plan_path)
 
+        # Include handoff context if available from previous run
+        handoff_path = docs / "handoff.md"
+        if handoff_path.exists():
+            docs_rel = self._docs_rel(docs)
+            prompt += f"\n\nPrevious session handoff: {docs_rel}/handoff.md"
+
         task.session_id = await backend.start(agent_config, task, prompt, self.git.project_path, stage=task.status.value, cli_flags=flags)
 
         task.touch()
@@ -245,9 +251,20 @@ class PipelineEngine:
             return True
 
     async def _stop_current_agent(self, task: Task) -> None:
-        """Stop the agent for the task's current stage."""
+        """Stop the agent for the task's current stage. Generates handoff file."""
         if not task.session_id:
             return
+        # Generate handoff before stopping
+        if self.agents.session_store:
+            ctx = self.agents.session_store.get(task.session_id)
+            if ctx and hasattr(ctx, "generate_handoff"):
+                try:
+                    handoff = ctx.generate_handoff(task.title, task.verify, task.done)
+                    if isinstance(handoff, str):
+                        docs = self._task_docs_dir(task)
+                        (docs / "handoff.md").write_text(handoff)
+                except Exception:
+                    pass
         try:
             agent_config = self.config.agent_for_stage(task.status, task)
             backend = self.agents.backend_for(agent_config.name)
@@ -476,12 +493,18 @@ class PipelineEngine:
     def _build_execute_prompt(self, task: Task, docs: Path, plan_path: Path) -> str:
         docs_rel = self._docs_rel(docs)
         plan_rel = self._plan_rel(plan_path)
-        return (
-            f"EXECUTE: {task.title}\n\n"
-            f"Task description: {docs_rel}/task.md\n"
-            f"Plan: {plan_rel}\n\n"
-            f"When finished, say: EXECUTE COMPLETE"
-        )
+        lines = [
+            f"EXECUTE: {task.title}",
+            "",
+            f"Task description: {docs_rel}/task.md",
+            f"Plan: {plan_rel}",
+        ]
+        if task.verify:
+            lines.append(f"Verify: {task.verify}")
+        if task.done:
+            lines.append(f"Done when: {task.done}")
+        lines.extend(["", "When finished, say: EXECUTE COMPLETE"])
+        return "\n".join(lines)
 
     def _build_review_prompt(self, task: Task, docs: Path, plan_path: Path) -> str:
         docs_rel = self._docs_rel(docs)
@@ -491,14 +514,21 @@ class PipelineEngine:
             review_path = plan_path.parent / self.config.project.review_file
             review_rel = str(review_path.relative_to(self.git.project_path))
             review_hint = f"Write your review to: {review_rel}\n"
-        return (
-            f"REVIEW: {task.title}\n\n"
-            f"Task description: {docs_rel}/task.md\n"
-            f"Plan: {plan_rel}\n"
-            f"Diff: {docs_rel}/diff.md\n"
-            f"{review_hint}\n"
-            f"When finished, say: REVIEW COMPLETE"
-        )
+        lines = [
+            f"REVIEW: {task.title}",
+            "",
+            f"Task description: {docs_rel}/task.md",
+            f"Plan: {plan_rel}",
+            f"Diff: {docs_rel}/diff.md",
+        ]
+        if review_hint:
+            lines.append(review_hint.rstrip())
+        if task.verify:
+            lines.append(f"Verify: {task.verify}")
+        if task.done:
+            lines.append(f"Done when: {task.done}")
+        lines.extend(["", "When finished, say: REVIEW COMPLETE"])
+        return "\n".join(lines)
 
     def _has_planning_stage(self) -> bool:
         return TaskStatus.PLANNING in self._configured_stages()

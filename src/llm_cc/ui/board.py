@@ -39,6 +39,12 @@ class TaskCard(Static, can_focus=False):
         self.column_idx = column_idx
         self.task_idx = task_idx
         self.waiting_for_input = False
+        self.stage_complete = False
+        self.health_score: int | None = None
+        self.health_color: str = "green"
+        self.top_error: str | None = None
+        self.context_remaining: int | None = None
+        self.context_color: str | None = None
 
     def on_click(self, event: Click) -> None:
         self.post_message(self.Clicked(self.column_idx, self.task_idx))
@@ -61,11 +67,20 @@ class TaskCard(Static, can_focus=False):
             lines.append(desc)
         if self.is_stale:
             lines.append("[bold red]STALE — r restart[/]")
+        elif self.stage_complete:
+            lines.append("[bold dark_orange]STAGE COMPLETE — m advance | b back[/]")
         elif self.waiting_for_input:
             lines.append("[bold yellow]WAITING FOR INPUT[/]")
         elif self.task_data.session_id:
             agent = self.task_data.agent_override or "agent"
-            lines.append(f"[{agent}]")
+            parts = [f"[{agent}]"]
+            if self.health_score is not None:
+                parts.append(f"[{self.health_color}]{self.health_score}/100[/]")
+            lines.append(" ".join(parts))
+            if self.top_error:
+                lines.append(f"[bold red][!] {self.top_error}[/]")
+            if self.context_remaining is not None and self.context_color:
+                lines.append(f"[{self.context_color}][ctx {self.context_remaining}%][/]")
         return "\n".join(lines)
 
 
@@ -137,7 +152,16 @@ class KanbanColumn(VerticalScroll, can_focus=False):
             if card.task_data.session_id:
                 card.set_class(True, "-has-agent")
             card.set_class(card.is_stale, "-stale")
+            card.set_class(card.stage_complete, "-stage-complete")
             card.set_class(card.waiting_for_input, "-waiting")
+            card.set_class(
+                card.health_score is not None and card.health_score < 50,
+                "-degraded",
+            )
+            card.set_class(
+                card.context_color == "red",
+                "-ctx-critical",
+            )
 
 
 class BoardScreen(Screen):
@@ -211,8 +235,9 @@ class BoardScreen(Screen):
             for card in col.query(TaskCard):
                 task = card.task_data
                 if not task.session_id:
-                    if card.waiting_for_input:
+                    if card.waiting_for_input or card.stage_complete:
                         card.waiting_for_input = False
+                        card.stage_complete = False
                         changed = True
                     continue
 
@@ -228,20 +253,43 @@ class BoardScreen(Screen):
                     and self.pipeline.is_brainstorm_stage(task)
                 ):
                     dead = not backend.is_alive(task.session_id)
-                    idle = (
-                        isinstance(backend, PtyBackend)
-                        and backend.is_waiting_for_input(task.session_id)
+                    idle = isinstance(backend, PtyBackend) and (
+                        backend.is_waiting_for_input(task.session_id)
+                        or backend.is_stage_complete(task.session_id)
                     )
                     if dead or idle:
                         self._do_brainstorm_advance(task.id)
                         changed = True
                         continue
 
-                # Existing: detect permission/input prompts
-                waiting = (
-                    isinstance(backend, PtyBackend)
-                    and backend.is_waiting_for_input(task.session_id)
-                )
+                # Fetch health score
+                if hasattr(backend, "health"):
+                    h = backend.health(task.session_id)
+                    if h is not None:
+                        old_score = card.health_score
+                        card.health_score = h.score
+                        card.health_color = h.color
+                        card.context_remaining = h.context_remaining
+                        card.context_color = h.context_color
+                        # Top error from recent errors
+                        if h.errors:
+                            worst = max(h.errors, key=lambda e: e.severity)
+                            card.top_error = worst.pattern_name
+                        else:
+                            card.top_error = None
+                        if card.health_score != old_score:
+                            changed = True
+
+                # Detect stage completion vs input waiting
+                if isinstance(backend, PtyBackend):
+                    complete = backend.is_stage_complete(task.session_id)
+                    waiting = backend.is_waiting_for_input(task.session_id)
+                else:
+                    complete = False
+                    waiting = False
+                if card.stage_complete != complete:
+                    card.stage_complete = complete
+                    changed = True
                 if card.waiting_for_input != waiting:
                     card.waiting_for_input = waiting
                     changed = True

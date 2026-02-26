@@ -97,8 +97,20 @@ TaskCard.-stale {
     border-left: thick $danger;
 }
 
+TaskCard.-stage-complete {
+    border-left: thick darkorange;
+}
+
 TaskCard.-waiting {
     border-left: thick $warning;
+}
+
+TaskCard.-degraded {
+    border-left: thick $warning;
+}
+
+TaskCard.-ctx-critical {
+    border-left: thick $danger;
 }
 
 /* --- Modals --- */
@@ -110,7 +122,7 @@ TaskInputDialog {
 #task-input-container {
     width: 60;
     height: auto;
-    max-height: 20;
+    max-height: 28;
     background: $surface;
     border: double $accent;
     padding: 1 2;

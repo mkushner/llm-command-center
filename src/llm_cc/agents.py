@@ -7,6 +7,7 @@ import atexit
 import os
 import shlex
 import shutil
+import time
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
@@ -14,6 +15,7 @@ import pyte
 from rich.style import Style
 from rich.text import Text
 
+from .health import AgentHealth, HealthScorer, SessionStore
 from .models import AgentConfig, AgentMode, Task, TaskStatus
 
 
@@ -54,7 +56,10 @@ _INPUT_PATTERNS = (
     # Agent idle / finished
     "what would you like",
     "how can i help",
-    # Stage completion markers (injected into agent prompts)
+)
+
+# Stage completion markers — agent declares stage done
+_COMPLETE_PATTERNS = (
     "planning complete",
     "execute complete",
     "review complete",
@@ -70,15 +75,24 @@ class OutputBuffer:
         self._log_file = None
         self._last_content: str = ""
         self._stable_ticks: int = 0  # how many polls the screen hasn't changed
+        self._total_bytes: int = 0
+        self._last_output_time: float = 0.0
         if log_path:
             log_path.parent.mkdir(parents=True, exist_ok=True)
             self._log_file = open(log_path, "a")
 
     def append(self, data: str) -> None:
         self._stream.feed(data)
+        self._total_bytes += len(data)
+        self._last_output_time = time.monotonic()
         if self._log_file:
             self._log_file.write(data)
             self._log_file.flush()
+
+    @property
+    def stats(self) -> tuple[int, float, int]:
+        """Return (total_bytes, last_output_time, stable_ticks)."""
+        return (self._total_bytes, self._last_output_time, self._stable_ticks)
 
     def mark_idle(self) -> None:
         """Called each poll tick (~0.1s). Tracks if visible content has changed."""
@@ -206,6 +220,17 @@ class OutputBuffer:
         self._screen.resize(rows, cols)
 
     @property
+    def appears_stage_complete(self) -> bool:
+        """Agent posted a stage completion marker (e.g., EXECUTE COMPLETE).
+
+        Same stability check as appears_waiting — content must be settled.
+        """
+        if self._stable_ticks < 3:
+            return False
+        screen_text = self.display().lower()
+        return any(p in screen_text for p in _COMPLETE_PATTERNS)
+
+    @property
     def appears_waiting(self) -> bool:
         """Heuristic: agent seems to be waiting for user input.
 
@@ -213,8 +238,11 @@ class OutputBuffer:
         AND the screen matches known input prompt patterns.
         Searches full screen since CLI prompts can render anywhere.
         The board's 2-second poll interval naturally debounces brief flickers.
+        Does NOT trigger for stage completion — that's a separate state.
         """
         if self._stable_ticks < 3:
+            return False
+        if self.appears_stage_complete:
             return False
         screen_text = self.display().lower()
         return any(p in screen_text for p in _INPUT_PATTERNS)
@@ -241,6 +269,11 @@ class PtyBackend:
         self._poll_tasks: dict[str, asyncio.Task[None]] = {}
         self._interrupted: set[str] = set()  # sessions with pending interrupt
         self._pm = process_manager
+        self._health_scorers: dict[str, HealthScorer] = {}
+        self._session_store: SessionStore | None = None
+
+    def set_session_store(self, store: SessionStore) -> None:
+        self._session_store = store
 
     async def start(self, config: AgentConfig, task: Task, prompt: str, cwd: Path, stage: str = "", cli_flags: str = "", terminal_size: tuple[int, int] | None = None) -> str:
         import pexpect
@@ -294,6 +327,13 @@ class PtyBackend:
 
         self._sessions[session_id] = child
         self._buffers[session_id] = OutputBuffer(log_path=log_path, cols=cols, rows=rows)
+        self._health_scorers[session_id] = HealthScorer()
+
+        # Create session context for persistence
+        if self._session_store:
+            self._session_store.get_or_create(
+                session_id, task.id, stage or task.status.value, config.name,
+            )
 
         # Register with process manager for crash cleanup
         if self._pm:
@@ -332,6 +372,12 @@ class PtyBackend:
         # Unregister from process manager
         if self._pm:
             self._pm.unregister(session_id)
+
+        # Clean up health scorer and session context
+        self._health_scorers.pop(session_id, None)
+        if self._session_store:
+            self._session_store.flush_force(session_id)
+            self._session_store.remove(session_id)
 
         # Clean up buffer and interrupt flag
         self._interrupted.discard(session_id)
@@ -400,12 +446,44 @@ class PtyBackend:
         child = self._sessions.get(session_id)
         return child is not None and hasattr(child, "isalive") and child.isalive()
 
+    def is_stage_complete(self, session_id: str) -> bool:
+        """True if agent posted a stage completion marker."""
+        buf = self._buffers.get(session_id)
+        return buf.appears_stage_complete if buf else False
+
     def is_waiting_for_input(self, session_id: str) -> bool:
         # Ctrl+C interrupt — immediately waiting until agent responds
         if session_id in self._interrupted:
             return True
         buf = self._buffers.get(session_id)
         return buf.appears_waiting if buf else False
+
+    def health(self, session_id: str) -> AgentHealth | None:
+        """Compute current health for a session."""
+        scorer = self._health_scorers.get(session_id)
+        buf = self._buffers.get(session_id)
+        if not scorer or not buf:
+            return None
+        alive = self.is_alive(session_id)
+        _, _, stable_ticks = buf.stats
+        screen_text = buf.display()
+        h = scorer.compute(alive, stable_ticks, screen_text)
+
+        # Record health event in session context
+        if self._session_store:
+            ctx = self._session_store.get(session_id)
+            if ctx:
+                ctx.add_event("health", {
+                    "score": h.score,
+                    "context_remaining": h.context_remaining,
+                    "context_warning": self.context_monitor_warning(scorer),
+                })
+                self._session_store.flush(session_id)
+        return h
+
+    @staticmethod
+    def context_monitor_warning(scorer: HealthScorer) -> str | None:
+        return scorer.context_monitor.warning_level
 
     def active_session_ids(self) -> list[str]:
         """List all active session IDs."""
@@ -436,6 +514,15 @@ class PtyBackend:
                     data = child.read_nonblocking(size=4096, timeout=0)
                     if data:
                         buf.append(data)
+                        # Record for health scoring
+                        scorer = self._health_scorers.get(session_id)
+                        if scorer:
+                            scorer.record_output(len(data))
+                        # Record output event in session context
+                        if self._session_store:
+                            ctx = self._session_store.get(session_id)
+                            if ctx:
+                                ctx.add_event("output", {"text": data[-200:]})
                         # Respond to cursor position queries (DSR).
                         # CLIs like codex send \x1b[6n to detect terminal size.
                         if "\x1b[6n" in data:
@@ -562,6 +649,18 @@ class ApiBackend:
         task = self._running.get(session_id)
         return task is not None and not task.done()
 
+    def health(self, session_id: str) -> AgentHealth | None:
+        """Static health for API backend: 75 if alive, 0 if dead."""
+        alive = self.is_alive(session_id)
+        score = 75 if alive else 0
+        return AgentHealth(
+            score=score,
+            liveness=25 if alive else 0,
+            activity=25 if alive else 0,
+            stability=25,
+            responsiveness=0 if alive else 0,
+        )
+
     def active_session_ids(self) -> list[str]:
         """List all active session IDs."""
         return list(self._running.keys())
@@ -604,10 +703,18 @@ atexit.register(_process_manager.cleanup_all)
 class AgentRegistry:
     """Central agent manager. Creates backends on demand, tracks sessions."""
 
-    def __init__(self, agents: dict[str, AgentConfig]) -> None:
+    def __init__(self, agents: dict[str, AgentConfig], sessions_dir: Path | None = None) -> None:
         self._configs = agents
         self._pty = PtyBackend(process_manager=_process_manager)
         self._api = ApiBackend()
+        self._session_store: SessionStore | None = None
+        if sessions_dir:
+            self._session_store = SessionStore(sessions_dir)
+            self._pty.set_session_store(self._session_store)
+
+    @property
+    def session_store(self) -> SessionStore | None:
+        return self._session_store
 
     def backend_for(
         self, agent_name: str, mode_override: AgentMode | None = None
@@ -644,6 +751,9 @@ class AgentRegistry:
 
     async def cleanup_all(self) -> None:
         """Terminate all sessions. Called on app exit."""
+        # Flush session store before stopping
+        if self._session_store:
+            self._session_store.flush_all()
         # Gather all session IDs, stop concurrently
         pty_sids = self._pty.active_session_ids()
         api_sids = self._api.active_session_ids()

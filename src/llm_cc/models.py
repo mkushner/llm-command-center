@@ -35,6 +35,8 @@ class Task(BaseModel):
     pr_number: int | None = None
     pr_url: str | None = None
     docs_path: str | None = None  # .llm-cc/tasks/<id>/ — shared docs between stages
+    verify: str | None = None   # how to verify task completion (e.g., "curl returns 200")
+    done: str | None = None     # definition of done (e.g., "login works with valid/invalid creds")
     sub_agent_idx: int = 0    # brainstorm: index into stage.agents
     loop_count: int = 0       # brainstorm: current cycle (0-based)
     brainstorm_summarizing: bool = False  # brainstorm: in final summary phase
