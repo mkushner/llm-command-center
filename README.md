@@ -35,8 +35,8 @@ Stages share context through files, not memory. Each task gets a docs directory 
 .llm-cc/tasks/a1b2c3d4/
 ├── task.md              # title + description (created on first advance)
 ├── planning-output.md   # captured when leaving planning stage
-├── diff.md              # git diff, written before review starts
 ├── review-output.md     # captured when leaving review stage
+├── handoff.md           # generated when agent stops (session context for restart)
 └── ...                  # agents can write additional files here
 ```
 
@@ -44,32 +44,99 @@ The agent receives a minimal prompt pointing to this directory. It reads what it
 
 **Key decision: file-based over in-memory.** Earlier versions captured PTY output into model fields (`review_feedback`) and injected it into prompts. This was fragile — large outputs got truncated, context was lost on restart, and the app was doing work agents should own. Now the app just writes files and points the agent at them. The agent decides what context it needs.
 
-### Agent Input Detection
+### Agent Status Detection
 
-The board polls active agents every 2s and shows a yellow **WAITING FOR INPUT** indicator when the agent appears idle. Detection uses two signals:
+The board polls active agents every 2s and detects two distinct states:
 
-1. **Screen stability** — the pyte terminal buffer hasn't changed for 3+ poll ticks (~0.3s)
-2. **Pattern matching** — full screen text matches known input patterns
+1. **STAGE COMPLETE** (orange) — agent posted a completion marker (`PLANNING COMPLETE`, `EXECUTE COMPLETE`, `REVIEW COMPLETE`). The agent believes its work is done. You decide: `m` advance, `b` revert, or interact further.
 
-Both must be true simultaneously. Brief flickering (green→yellow→green) can occur when agents redraw the screen — this is expected and draws attention to prompts that need response.
+2. **WAITING FOR INPUT** (yellow) — agent is idle at a permission prompt, needs approval, or is asking a question. Not the same as stage complete.
+
+Both use the same detection mechanism: screen stability (3+ poll ticks with no change) + pattern matching on the full pyte screen buffer. Stage complete takes priority — if a completion marker is present, it shows orange even if input patterns also match.
 
 ```python
+_COMPLETE_PATTERNS = (
+    "planning complete", "execute complete", "review complete",
+)
+
 _INPUT_PATTERNS = (
-    # Claude CLI permission prompts
     "enter to confirm", "y/n", "yes/no", "(y)es/(n)o",
     "allow", "deny", "press enter", "esc to cancel",
     "do you want to proceed", "tab to amend",
     "i trust this", "yes, i trust", "interrupt received",
-    # Agent idle / finished
     "what would you like", "how can i help",
-    # Stage completion markers
-    "planning complete", "execute complete", "review complete",
 )
 ```
 
-**Important: searches full screen, not bottom N lines.** CLI tools use cursor positioning escape codes (ANSI CSI sequences) that can render prompts anywhere on the virtual terminal. Searching only the bottom rows misses prompts rendered higher up. The pyte `Screen.display` returns the full 40-row buffer — we search all of it.
+**Important: searches full screen, not bottom N lines.** CLI tools use cursor positioning escape codes (ANSI CSI sequences) that can render prompts anywhere on the virtual terminal. The pyte `Screen.display` returns the full 40-row buffer — we search all of it.
 
-Agents are prompted to say `PLANNING COMPLETE` / `EXECUTE COMPLETE` / `REVIEW COMPLETE` when done. These trigger the waiting indicator — you then decide whether to advance, interact, or restart. There is no separate "stage complete" state — all waiting is treated uniformly.
+### Health Monitoring
+
+Each PTY agent session gets a composite health score (0-100) computed from four components:
+
+| Component | Range | What it measures |
+|-----------|-------|-----------------|
+| Liveness | 0-25 | Process alive or dead |
+| Activity | 0-25 | Time since last output (25 if <5s, scales to 5 if >60s) |
+| Stability | 0-25 | 25 minus severity-weighted error penalties |
+| Responsiveness | 0-25 | Screen change frequency (stable_ticks) |
+
+The card shows `[agent] 85/100` with color coding: green (>=75), yellow (>=50), orange (>=25), red (<25).
+
+**Error detection** scans screen text for 9 patterns (auth failure, rate limit, token overflow, build failure, test failure, git conflict, agent crash, plan stuck, permission wait). Same-pattern deduplication within 30s. Errors show as `[!] pattern_name` on the card.
+
+**Context monitoring** parses `XX% of context` patterns from agent output. Shows `[ctx 25%]` when remaining context drops below 30% (yellow) or 10% (red).
+
+**Session persistence** — each session maintains a ring buffer (50 events max) of output, errors, and health snapshots. Persisted to `.llm-cc/sessions/{session_id}.json` with 3s debounce. On agent stop, a human-readable `handoff.md` is generated in the task docs directory with position, recent activity, errors, and context status. On restart, the agent prompt references the handoff file.
+
+All monitoring is local string scanning — no API calls, no token cost.
+
+### Session Resume
+
+When advancing between stages, the pipeline checks whether the same agent handles both stages. If so, it **resumes the existing session** instead of killing and spawning a new process. The agent keeps its full context — it already knows the plan because it wrote it.
+
+```
+Same agent (planning → execute):
+  Agent writes plan → says PLANNING COMPLETE → pipeline sends execute prompt
+  to the same session → agent continues with full context from planning
+
+Different agents (claude_opus → claude_sonnet):
+  Kill opus session → spawn sonnet session (fresh context, reads files from disk)
+```
+
+Resume conditions (all must hold):
+- Same agent name between current and next stage
+- Same backend type (both PTY or both API)
+- Same `cli_flags` between stages
+- Same `mode_override` between stages
+- Process is alive
+- Not a brainstorm stage (sub-agents have different roles)
+
+Token savings: the agent doesn't re-read task.md, plan.md, or any context files it already has in its session. For a 3-stage pipeline with the same agent, context is ingested once instead of three times.
+
+**Brainstorm sessions** use a different optimization — see below.
+
+### Brainstorm Session Persistence
+
+In brainstorm mode, agents are kept alive between cycles instead of killed and restarted. Each agent maintains its own persistent session:
+
+```
+Current (kill/restart, 2 agents × 2 cycles):
+  strategist_c1: reads task.md                         → T tokens
+  critic_c1:     reads task.md + strategist-cycle1.md   → T + S1
+  strategist_c2: reads task.md + S1 + critic-cycle1.md  → T + S1 + C1
+  critic_c2:     reads task.md + S1 + C1 + S2           → T + S1 + C1 + S2
+  Total re-reads: 4T + 3S1 + 2C1 + S2 (quadratic)
+
+Persistent sessions (keep alive, alternate):
+  strategist_c1: reads task.md                          → T tokens
+  critic_c1:     reads task.md + strategist-cycle1.md   → T + S1
+  strategist_c2: reads critic-cycle1.md only            → C1 (already has T + own S1)
+  critic_c2:     reads strategist-cycle2.md only         → S2 (already has T + S1 + own C1)
+  Total re-reads: 2T + S1 + C1 + S2 (linear)
+```
+
+Implementation: parked sessions are stored in `PipelineEngine._brainstorm_sessions` keyed by `task_id → {sub_agent_idx: session_id}`. When switching roles, the active agent is parked (not killed) and the next agent is resumed (or started if first cycle). Summarizer always starts fresh. All parked sessions are cleaned up when brainstorm completes, task reverts, or task is deleted.
 
 ## Keybindings
 
@@ -438,6 +505,8 @@ class Task(BaseModel):
     pr_number: int | None
     pr_url: str | None
     docs_path: str | None            # .llm-cc/tasks/<id>/ — shared docs between stages
+    verify: str | None               # how to verify completion (e.g., "curl returns 200")
+    done: str | None                 # definition of done (e.g., "login works with valid/invalid creds")
     sub_agent_idx: int               # brainstorm: current index into stage.agents
     loop_count: int                  # brainstorm: current cycle (0-based)
     brainstorm_summarizing: bool     # brainstorm: in final summary phase
@@ -593,7 +662,7 @@ async def advance(task):
     # 4. Match on next stage:
     #    PLANNING: git setup + start agent
     #    EXECUTE:  git setup (if no PLANNING) + validate slot (NONE/BRANCH) + start agent
-    #    REVIEW:   write diff.md + start agent
+    #    REVIEW:   start agent
     #    DONE:     cleanup git, clear session
     # 5. Save task to storage
 
@@ -605,8 +674,7 @@ async def revert(task):
 
 async def restart(task):
     # 1. Stop current agent
-    # 2. Re-generate context files (diff.md for review)
-    # 3. Start new agent at same stage
+    # 2. Start new agent at same stage (with handoff context if available)
     # 4. Save
 ```
 
@@ -616,9 +684,9 @@ Per-stage prompt builders. Each is minimal — points agent at task docs and pla
 
 - **Planning**: task description + plan path to write to
 - **Execute**: task description + plan path to read
-- **Review**: task description + plan path + diff.md
+- **Review**: task description + plan path
 
-The agent discovers context by reading files. The planning agent writes a plan to the configured `plan_dir/plan_file`. The execute agent reads it. The review agent gets a pre-written `diff.md`. Users configure agent behavior via `CLAUDE.md` and project-level agent config — not through our prompt templates.
+The agent discovers context by reading files. The planning agent writes a plan to the configured `plan_dir/plan_file`. The execute agent reads it. The review agent reads the plan and runs its own diff. Users configure agent behavior via `CLAUDE.md` and project-level agent config — not through our prompt templates.
 
 ### Execute slot validation
 
@@ -727,7 +795,7 @@ openai>=1.60       # API backend
 │       ├── task.md
 │       ├── plan.md           # (default location; configurable via plan_dir)
 │       ├── planning-output.md
-│       ├── diff.md
+│       ├── handoff.md
 │       └── review-output.md
 ├── logs/                    # agent PTY output logs
 │   └── pty_<id>_<stage>.log

@@ -749,6 +749,13 @@ class AgentRegistry:
     def available_agents(self) -> list[str]:
         return [name for name in self._configs if self.is_available(name)]
 
+    async def stop_session(self, session_id: str) -> None:
+        """Stop a specific session, routing to the correct backend."""
+        if session_id in self._pty._sessions:
+            await self._pty.stop(session_id)
+        elif session_id in self._api._running:
+            await self._api.stop(session_id)
+
     async def cleanup_all(self) -> None:
         """Terminate all sessions. Called on app exit."""
         # Flush session store before stopping
