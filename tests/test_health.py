@@ -96,19 +96,19 @@ def test_context_monitor_parse_context_percent():
 
 
 def test_context_monitor_warning_levels():
-    """Warning levels: None >30%, warning 10-30%, critical <10%."""
+    """Warning levels: None >=70%, warning 30-70%, critical <30%."""
     mon = ContextMonitor()
 
-    # >30% remaining = no warning
-    mon.context_percent = 60  # 40% remaining
+    # >=70% remaining = no warning
+    mon.context_percent = 20  # 80% remaining
     assert mon.warning_level is None
 
-    # 10-30% remaining = warning
-    mon.context_percent = 80  # 20% remaining
+    # 30-70% remaining = warning
+    mon.context_percent = 50  # 50% remaining
     assert mon.warning_level == "warning"
 
-    # <10% remaining = critical
-    mon.context_percent = 95  # 5% remaining
+    # <30% remaining = critical
+    mon.context_percent = 80  # 20% remaining
     assert mon.warning_level == "critical"
 
 
@@ -177,13 +177,13 @@ def test_health_context_color():
     h = AgentHealth(score=75, liveness=25, activity=25, stability=25, responsiveness=0)
     assert h.context_color is None  # unknown
 
-    h.context_remaining = 50
+    h.context_remaining = 75
     assert h.context_color == "green"
 
-    h.context_remaining = 20
+    h.context_remaining = 50
     assert h.context_color == "yellow"
 
-    h.context_remaining = 5
+    h.context_remaining = 20
     assert h.context_color == "red"
 
 

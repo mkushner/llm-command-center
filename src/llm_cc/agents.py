@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import json
 import os
 import shlex
 import shutil
@@ -271,6 +272,7 @@ class PtyBackend:
         self._pm = process_manager
         self._health_scorers: dict[str, HealthScorer] = {}
         self._session_store: SessionStore | None = None
+        self._status_files: dict[str, Path] = {}  # session_id -> status file path
 
     def set_session_store(self, store: SessionStore) -> None:
         self._session_store = store
@@ -314,6 +316,10 @@ class PtyBackend:
 
         # Clean env: allow nested Claude sessions from TUI
         spawn_env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+        spawn_env["LLM_CC_TASK_ID"] = task.id
+
+        # Track status file for statusline data
+        self._status_files[session_id] = cwd / ".llm-cc" / "status" / f"{task.id}.json"
 
         # Spawn in PTY
         child = pexpect.spawn(
@@ -372,6 +378,14 @@ class PtyBackend:
         # Unregister from process manager
         if self._pm:
             self._pm.unregister(session_id)
+
+        # Clean up status file
+        status_file = self._status_files.pop(session_id, None)
+        if status_file and status_file.exists():
+            try:
+                status_file.unlink()
+            except Exception:
+                pass
 
         # Clean up health scorer and session context
         self._health_scorers.pop(session_id, None)
@@ -467,7 +481,8 @@ class PtyBackend:
         alive = self.is_alive(session_id)
         _, _, stable_ticks = buf.stats
         screen_text = buf.display()
-        h = scorer.compute(alive, stable_ticks, screen_text)
+        status_data = self._read_status_file(session_id)
+        h = scorer.compute(alive, stable_ticks, screen_text, status_data)
 
         # Record health event in session context
         if self._session_store:
@@ -480,6 +495,19 @@ class PtyBackend:
                 })
                 self._session_store.flush(session_id)
         return h
+
+    def status_data(self, session_id: str) -> dict | None:
+        """Public access to statusline data for a session."""
+        return self._read_status_file(session_id)
+
+    def _read_status_file(self, session_id: str) -> dict | None:
+        status_file = self._status_files.get(session_id)
+        if not status_file or not status_file.exists():
+            return None
+        try:
+            return json.loads(status_file.read_text())
+        except Exception:
+            return None
 
     @staticmethod
     def context_monitor_warning(scorer: HealthScorer) -> str | None:

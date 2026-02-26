@@ -45,6 +45,7 @@ class TaskCard(Static, can_focus=False):
         self.top_error: str | None = None
         self.context_remaining: int | None = None
         self.context_color: str | None = None
+        self.total_tokens: int | None = None
 
     def on_click(self, event: Click) -> None:
         self.post_message(self.Clicked(self.column_idx, self.task_idx))
@@ -79,8 +80,14 @@ class TaskCard(Static, can_focus=False):
             lines.append(" ".join(parts))
             if self.top_error:
                 lines.append(f"[bold red][!] {self.top_error}[/]")
+            status_parts: list[str] = []
             if self.context_remaining is not None and self.context_color:
-                lines.append(f"[{self.context_color}][ctx {self.context_remaining}%][/]")
+                status_parts.append(f"[{self.context_color}]{self.context_remaining}% ctx[/]")
+            if self.total_tokens is not None:
+                tk = self.total_tokens / 1000
+                status_parts.append(f"[dim]{tk:.0f}k tokens[/]")
+            if status_parts:
+                lines.append(" | ".join(status_parts))
         return "\n".join(lines)
 
 
@@ -266,19 +273,21 @@ class BoardScreen(Screen):
                 if hasattr(backend, "health"):
                     h = backend.health(task.session_id)
                     if h is not None:
-                        old_score = card.health_score
                         card.health_score = h.score
                         card.health_color = h.color
                         card.context_remaining = h.context_remaining
                         card.context_color = h.context_color
+                        # Current context window token count
+                        token_sum = (h.input_tokens or 0) + (h.cache_creation_tokens or 0) + (h.cache_read_tokens or 0)
+                        card.total_tokens = token_sum if token_sum > 0 else None
                         # Top error from recent errors
                         if h.errors:
                             worst = max(h.errors, key=lambda e: e.severity)
                             card.top_error = worst.pattern_name
                         else:
                             card.top_error = None
-                        if card.health_score != old_score:
-                            changed = True
+                        card.refresh()
+                        changed = True
 
                 # Detect stage completion vs input waiting
                 if isinstance(backend, PtyBackend):

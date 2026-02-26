@@ -147,6 +147,7 @@ class AgentPanel(ModalScreen[None]):
         with Vertical(id="agent-panel"):
             yield Static(f"Agent Session: {self._session_id}", classes="column-header")
             yield VerticalScroll(Static("Loading...", id="agent-output"), id="agent-scroll")
+            yield Static("", id="agent-status")
             yield Static(
                 "[dim]All keys go to agent  |  [bold]Ctrl+C[/] interrupt  |  [bold]Ctrl+T[/] text input  |  [bold]Shift+PgUp/PgDn[/] scroll  |  [bold]Esc[/] close[/]",
                 id="agent-help",
@@ -265,6 +266,41 @@ class AgentPanel(ModalScreen[None]):
         if hasattr(self._backend, "send_raw"):
             await self._backend.send_raw(self._session_id, data)
 
+    def _format_status_bar(self, status_data: dict) -> str:
+        """Format status data into a compact status bar string."""
+        parts: list[str] = []
+        ctx = status_data.get("context_window", {})
+        usage = ctx.get("current_usage") or {}
+
+        used = ctx.get("used_percentage")
+        if used is not None:
+            remaining = 100 - used
+            if remaining >= 70:
+                color = "green"
+            elif remaining >= 30:
+                color = "yellow"
+            else:
+                color = "red"
+            parts.append(f"[{color}]{remaining}% ctx[/{color}]")
+
+        input_tok = usage.get("input_tokens")
+        if input_tok is not None:
+            parts.append(f"{input_tok / 1000:.1f}k in")
+
+        output_tok = usage.get("output_tokens")
+        if output_tok is not None:
+            parts.append(f"{output_tok / 1000:.1f}k out")
+
+        cache_create = usage.get("cache_creation_input_tokens")
+        if cache_create is not None:
+            parts.append(f"{cache_create / 1000:.1f}k cache wr")
+
+        cache_read = usage.get("cache_read_input_tokens")
+        if cache_read is not None:
+            parts.append(f"{cache_read / 1000:.1f}k cache rd")
+
+        return " | ".join(parts)
+
     @work(exclusive=True)
     async def _poll_output(self) -> None:
         """Continuously refresh agent output with Rich colors and scrollback."""
@@ -272,6 +308,7 @@ class AgentPanel(ModalScreen[None]):
 
         output_widget = self.query_one("#agent-output", Static)
         scroll = self.query_one("#agent-scroll", VerticalScroll)
+        status_widget = self.query_one("#agent-status", Static)
         while self._polling:
             try:
                 # Check if user is at/near bottom BEFORE updating content
@@ -302,6 +339,13 @@ class AgentPanel(ModalScreen[None]):
                     text = await self._backend.get_output(self._session_id)
                     if text:
                         output_widget.update(text)
+
+                # Update status bar from backend's statusline data
+                status_data = None
+                if hasattr(self._backend, "status_data"):
+                    status_data = self._backend.status_data(self._session_id)
+                if status_data:
+                    status_widget.update(self._format_status_bar(status_data))
 
                 # Only auto-scroll if user was at bottom before content update
                 if at_bottom:

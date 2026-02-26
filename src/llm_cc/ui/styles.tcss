@@ -188,6 +188,15 @@ AgentPanel {
     color: $text;
 }
 
+#agent-status {
+    dock: bottom;
+    height: 1;
+    color: $text;
+    background: $surface-hl;
+    padding: 0 1;
+    border-top: solid $border;
+}
+
 #agent-help {
     dock: bottom;
     height: 1;

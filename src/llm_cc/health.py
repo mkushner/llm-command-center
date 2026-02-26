@@ -133,6 +133,13 @@ class ContextMonitor:
                 if 0 <= pct <= 100:
                     self.context_percent = pct
 
+    def update_from_status(self, status_data: dict) -> None:
+        """Update from Claude Code statusline JSON — overrides screen scraping."""
+        ctx = status_data.get("context_window", {})
+        used = ctx.get("used_percentage")
+        if used is not None and 0 <= used <= 100:
+            self.context_percent = used
+
     @property
     def remaining(self) -> int | None:
         """Percent of context remaining, None if unknown."""
@@ -142,13 +149,13 @@ class ContextMonitor:
 
     @property
     def warning_level(self) -> str | None:
-        """None if OK or unknown, 'warning' if 10-30% remaining, 'critical' if <10%."""
+        """None if OK or unknown, 'warning' if 30-70% remaining, 'critical' if <30%."""
         r = self.remaining
         if r is None:
             return None
-        if r < 10:
+        if r < 30:
             return "critical"
-        if r <= 30:
+        if r < 70:
             return "warning"
         return None
 
@@ -165,6 +172,11 @@ class AgentHealth:
     responsiveness: int  # 0-25
     context_remaining: int | None = None  # percent remaining, None if unknown
     errors: list[DetectedError] = field(default_factory=list)
+    # Current context window usage (from current_usage)
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cache_creation_tokens: int | None = None
+    cache_read_tokens: int | None = None
 
     @property
     def color(self) -> str:
@@ -190,9 +202,9 @@ class AgentHealth:
     def context_color(self) -> str | None:
         if self.context_remaining is None:
             return None
-        if self.context_remaining > 30:
+        if self.context_remaining >= 70:
             return "green"
-        if self.context_remaining >= 10:
+        if self.context_remaining >= 30:
             return "yellow"
         return "red"
 
@@ -211,11 +223,14 @@ class HealthScorer:
         self._total_bytes += data_len
         self._last_output_time = time.monotonic()
 
-    def compute(self, alive: bool, stable_ticks: int, screen_text: str) -> AgentHealth:
+    def compute(self, alive: bool, stable_ticks: int, screen_text: str, status_data: dict | None = None) -> AgentHealth:
         """Compute health score from current state."""
         # Run detectors
         self.error_detector.scan(screen_text)
-        self.context_monitor.scan(screen_text)
+        if status_data:
+            self.context_monitor.update_from_status(status_data)
+        else:
+            self.context_monitor.scan(screen_text)
 
         now = time.monotonic()
 
@@ -251,6 +266,19 @@ class HealthScorer:
 
         score = liveness + activity + stability + responsiveness
 
+        # Extract current context window token usage from statusline
+        input_tok = None
+        output_tok = None
+        cache_create = None
+        cache_read = None
+        if status_data:
+            ctx = status_data.get("context_window", {})
+            usage = ctx.get("current_usage") or {}
+            input_tok = usage.get("input_tokens")
+            output_tok = usage.get("output_tokens")
+            cache_create = usage.get("cache_creation_input_tokens")
+            cache_read = usage.get("cache_read_input_tokens")
+
         return AgentHealth(
             score=score,
             liveness=liveness,
@@ -259,6 +287,10 @@ class HealthScorer:
             responsiveness=responsiveness,
             context_remaining=self.context_monitor.remaining,
             errors=self.error_detector.recent_errors,
+            input_tokens=input_tok,
+            output_tokens=output_tok,
+            cache_creation_tokens=cache_create,
+            cache_read_tokens=cache_read,
         )
 
 
