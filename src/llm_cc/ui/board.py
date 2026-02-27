@@ -176,9 +176,13 @@ class BoardScreen(Screen):
 
     BINDINGS = [
         Binding("h", "move_left", "Left", show=True),
+        Binding("left", "move_left", "Left", show=False),
         Binding("l", "move_right", "Right", show=True),
+        Binding("right", "move_right", "Right", show=False),
         Binding("j", "move_down", "Down", show=True),
+        Binding("down", "move_down", "Down", show=False),
         Binding("k", "move_up", "Up", show=True),
+        Binding("up", "move_up", "Up", show=False),
         Binding("o", "new_task", "New Task", show=True),
         Binding("e", "edit_task", "Edit", show=True),
         Binding("enter", "open_agent", "Agent", show=True),
