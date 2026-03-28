@@ -192,6 +192,18 @@ class Storage:
 
 # --- Default configs ---
 
+_DEFAULT_CLAUDE_ALLOWED_TOOLS: list[str] = [
+    "Read", "Glob", "Grep", "LS", "WebFetch", "WebSearch",
+    "Bash(git status:*)", "Bash(git log:*)", "Bash(git diff:*)",
+    "Bash(git show:*)", "Bash(git branch:*)",
+    "Bash(gh issue:*)", "Bash(gh pr list:*)", "Bash(gh pr view:*)",
+    "Bash(gh pr checks:*)", "Bash(gh pr diff:*)",
+    "Bash(ls:*)", "Bash(cat:*)", "Bash(head:*)", "Bash(tail:*)",
+    "Bash(find:*)", "Bash(grep:*)", "Bash(rg:*)",
+    "Bash(wc:*)", "Bash(file:*)", "Bash(which:*)",
+    "Bash(echo:*)", "Bash(pwd:*)",
+]
+
 
 def _default_agents() -> dict[str, AgentConfig]:
     return {
@@ -200,6 +212,7 @@ def _default_agents() -> dict[str, AgentConfig]:
             command="claude",
             args_template="{prompt}",
             co_author="Claude <noreply@anthropic.com>",
+            allowed_tools=_DEFAULT_CLAUDE_ALLOWED_TOOLS,
         ),
         "codex": AgentConfig(
             name="codex",

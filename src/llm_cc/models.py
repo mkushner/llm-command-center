@@ -99,6 +99,7 @@ class AgentConfig(BaseModel):
     resume_template: str | None = None
     co_author: str = ""
     detect_command: str | None = None
+    allowed_tools: list[str] = []  # auto-approved tool patterns (e.g. Read, Bash(git:*))
 
     @property
     def display_label(self) -> str:
@@ -115,7 +116,7 @@ class PipelineStage(BaseModel):
     stage: TaskStatus
     agent: str = ""
     agents: list[str] = []                # sequential sub-agents for brainstorm
-    max_loops: int = 1                    # how many full cycles through agents list
+    max_loops: int = Field(default=1, ge=1, le=10)  # cycles through agents list
     summarizer: str = ""                  # agent that writes final summary after all loops
     mode_override: AgentMode | None = None
     prompt_template: str | None = None
@@ -149,7 +150,7 @@ class GitMode(str, Enum):
 
 
 class GitConfig(BaseModel):
-    mode: GitMode = GitMode.NONE
+    mode: GitMode = GitMode.WORKTREE
     base_branch: str = "main"
     branch_prefix: str = "task/"  # prefix for branch names, e.g. "task/" → "task/a1b2-slug"
     copy_files: list[str] = []
@@ -169,6 +170,7 @@ class ProjectConfig(BaseModel):
     plan_dir: str = ".llm-cc/tasks/{id}"  # template: {id}, {slug}, {branch}, {title}
     plan_file: str = "plan.md"  # constant filename within plan_dir
     review_file: str | None = None  # optional: where review agent writes summary (resolved in plan_dir)
+    context_restart_threshold: int = 10  # auto-restart at this % remaining (0 disables)
 
 
 class GlobalConfig(BaseModel):

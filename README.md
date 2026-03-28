@@ -54,6 +54,8 @@ The board polls active agents every 2s and detects two distinct states:
 
 Both use the same detection mechanism: screen stability (3+ poll ticks with no change) + pattern matching on the full pyte screen buffer. Stage complete takes priority — if a completion marker is present, it shows orange even if input patterns also match.
 
+Both states trigger a **desktop notification** (Textual toast + terminal bell) when detected, so you don't need to watch the board. Stage complete shows as a warning-severity notification.
+
 ```python
 _COMPLETE_PATTERNS = (
     "planning complete", "execute complete", "review complete",
@@ -87,9 +89,11 @@ The card shows `[agent] 85/100` with color coding: green (>=75), yellow (>=50), 
 
 **Context monitoring** parses `XX% of context` patterns from agent output. Shows `[ctx 25%]` when remaining context drops below 30% (yellow) or 10% (red).
 
-**Session persistence** — each session maintains a ring buffer (50 events max) of output, errors, and health snapshots. Persisted to `.llm-cc/sessions/{session_id}.json` with 3s debounce. On agent stop, a human-readable `handoff.md` is generated in the task docs directory with position, recent activity, errors, and context status. On restart, the agent prompt references the handoff file.
+**Auto context restart** — when remaining context drops to a critical threshold (default 10%), the agent is automatically stopped, its session log is compressed into a structured summary via Haiku API, and the agent is restarted with the summary as context. The compressed summary includes: completed work, current state, key decisions, errors, and next steps. If the Anthropic SDK is not installed, the restart still happens using the handoff file only. Configure with `context_restart_threshold` in project config (set to 0 to disable).
 
-All monitoring is local string scanning — no API calls, no token cost.
+**Session persistence** — each session maintains a ring buffer (50 events max) of output, errors, and health snapshots. Persisted to `.llm-cc/sessions/{session_id}.json` with 3s debounce. Session files older than 7 days are automatically cleaned up on startup. On agent stop, a human-readable `handoff.md` is generated in the task docs directory with position, recent activity, errors, and context status. On restart, the agent prompt references the handoff file.
+
+All monitoring is local string scanning — no API calls, no token cost (except for context restart compression, which uses one Haiku call at ~$0.001).
 
 ### Session Resume
 
@@ -113,6 +117,10 @@ Resume conditions (all must hold):
 - Not a brainstorm stage (sub-agents have different roles)
 
 Token savings: the agent doesn't re-read task.md, plan.md, or any context files it already has in its session. For a 3-stage pipeline with the same agent, context is ingested once instead of three times.
+
+### Execute → Review Compression
+
+When advancing from EXECUTE to REVIEW, the execute agent's PTY log is compressed into a structured summary via the Haiku API and written to `execute-summary.md` in the task docs. The review prompt references this file, giving the review agent a concise overview of what happened during execution (completed work, current state, errors, decisions) without needing to parse raw terminal output. Falls back silently if the Anthropic SDK is not installed.
 
 **Brainstorm sessions** use a different optimization — see below.
 
@@ -182,10 +190,11 @@ Works out of the box with no config file. Default pipeline uses `claude` for all
 ```toml
 [project]
 name = "my-project"
+context_restart_threshold = 10  # auto-restart agent at this % context remaining (0 = disable)
 
-# Git isolation mode: "none" (default), "worktree", or "branch"
+# Git isolation mode: "worktree" (default), "branch", or "none"
 [git]
-mode = "none"
+mode = "worktree"
 base_branch = "main"
 branch_prefix = "task/"   # prefix for branch names; "" for flat naming
 
@@ -194,6 +203,7 @@ branch_prefix = "task/"   # prefix for branch names; "" for flat naming
 command = "claude"
 model = "claude-opus-4-6"                # shown in column header + auto-injected as --model flag
 mode = "pty"
+# allowed_tools inherited from defaults (read-only ops auto-approved)
 
 [agents.claude_sonnet]
 command = "claude"
@@ -286,18 +296,26 @@ When a task enters a stage, the agent is resolved in order:
 
 | Mode | Behavior | Concurrent Execute |
 |------|----------|-------------------|
-| `none` | Agent runs in project directory as-is | One task at a time |
-| `branch` | Creates a branch, no directory isolation | One task at a time |
 | `worktree` | Each task gets its own git worktree under `.llm-cc/worktrees/` | Unlimited |
+| `branch` | Creates a branch, no directory isolation | One task at a time |
+| `none` | Agent runs in project directory as-is | One task at a time |
 
-`none` is the default. With worktree/branch modes, the pipeline creates git branches named `{branch_prefix}<id>-<slug>` and manages workspace setup (file copying, init scripts). The `branch_prefix` defaults to `task/` but is configurable (set to `""` for flat branch names).
+`worktree` is the default — each task gets filesystem isolation, enabling concurrent execution. With worktree/branch modes, the pipeline creates git branches named `{branch_prefix}<id>-<slug>` and manages workspace setup (file copying, init scripts). The `branch_prefix` defaults to `task/` but is configurable (set to `""` for flat branch names).
 
 ### Built-in agents
 
 Two agents are registered by default (override in config):
 
-- **claude** — `claude {prompt}`
+- **claude** — `claude {prompt}` — ships with `--allowedTools` for read-only operations (Read, Glob, Grep, LS, git status, gh queries, etc.) so the agent doesn't prompt for every file read
 - **codex** — `codex "{prompt}"`
+
+The `allowed_tools` field on `AgentConfig` controls which tool patterns are auto-approved via the Claude CLI `--allowedTools` flag. The default list covers read-only operations only — no writes, edits, or destructive commands. Override per-agent in config:
+
+```toml
+[agents.my_claude]
+command = "claude"
+allowed_tools = ["Read", "Glob", "Grep"]  # restrict to fewer tools
+```
 
 An "agent" is a named config, not a product. The same CLI with different models = different agent configs:
 
@@ -528,6 +546,7 @@ class AgentConfig(BaseModel):
     resume_template: str | None      # template for session resume
     co_author: str                   # git co-author line
     detect_command: str | None       # command to check availability
+    allowed_tools: list[str]         # auto-approved tool patterns (claude --allowedTools)
 ```
 
 ### Pipeline stage
@@ -560,13 +579,14 @@ class ProjectConfig(BaseModel):
     plan_dir: str = ".llm-cc/tasks/{id}" # template: {id}, {slug}, {branch}, {title}
     plan_file: str = "plan.md"           # constant filename within plan_dir
     review_file: str | None = None       # optional: where review agent writes summary (in plan_dir)
+    context_restart_threshold: int = 10  # auto-restart at this % remaining (0 disables)
 ```
 
 ### Git config
 
 ```python
 class GitConfig(BaseModel):
-    mode: GitMode = GitMode.NONE         # "none", "worktree", or "branch"
+    mode: GitMode = GitMode.WORKTREE     # "worktree", "branch", or "none"
     base_branch: str = "main"            # auto-detected from repo
     branch_prefix: str = "task/"         # prefix for branch names
     copy_files: list[str] = []           # files to copy into worktrees
@@ -793,12 +813,16 @@ openai>=1.60       # API backend
 ├── tasks/                   # per-task docs (context between stages)
 │   └── <task-id>/
 │       ├── task.md
-│       ├── plan.md           # (default location; configurable via plan_dir)
+│       ├── plan.md              # (default location; configurable via plan_dir)
 │       ├── planning-output.md
 │       ├── handoff.md
-│       └── review-output.md
+│       ├── review-output.md
+│       ├── execute-summary.md   # Haiku-compressed execute log (for review stage)
+│       └── context-summary.md   # Haiku-compressed session log (on context restart)
 ├── logs/                    # agent PTY output logs
 │   └── pty_<id>_<stage>.log
+├── sessions/                # session ring buffers (auto-cleaned after 7 days)
+│   └── <session_id>.json
 └── worktrees/               # git worktrees (if git.mode = "worktree")
     └── <id>-<slug>/
 

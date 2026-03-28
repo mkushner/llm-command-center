@@ -419,10 +419,24 @@ class SessionContext:
 class SessionStore:
     """Manages session contexts with debounced disk persistence."""
 
+    SESSION_MAX_AGE_DAYS = 7
+
     def __init__(self, sessions_dir: Path) -> None:
         self._dir = sessions_dir
         self._dir.mkdir(parents=True, exist_ok=True)
         self._contexts: dict[str, SessionContext] = {}
+        self._cleanup_old_sessions()
+
+    def _cleanup_old_sessions(self) -> None:
+        """Remove session files older than SESSION_MAX_AGE_DAYS by mtime."""
+        max_age = self.SESSION_MAX_AGE_DAYS * 86400
+        now = time.time()
+        for f in self._dir.glob("*.json"):
+            try:
+                if now - f.stat().st_mtime > max_age:
+                    f.unlink()
+            except Exception:
+                pass
 
     def get_or_create(
         self, session_id: str, task_id: str, stage: str, agent_name: str,

@@ -210,6 +210,7 @@ class BoardScreen(Screen):
         self._active_col: int = 0
         self._columns: list[KanbanColumn] = []
         self._poll_timer = None
+        self._context_restarted: set[str] = set()  # session_ids already auto-restarted
 
     def compose(self) -> ComposeResult:
         yield Static(
@@ -274,6 +275,7 @@ class BoardScreen(Screen):
                         continue
 
                 # Fetch health score
+                h = None
                 if hasattr(backend, "health"):
                     h = backend.health(task.session_id)
                     if h is not None:
@@ -293,6 +295,26 @@ class BoardScreen(Screen):
                         card.refresh()
                         changed = True
 
+                # Auto-restart on critical context pressure
+                if (
+                    h is not None
+                    and self._config.project.context_restart_threshold > 0
+                    and h.context_remaining is not None
+                    and h.context_remaining <= self._config.project.context_restart_threshold
+                    and task.session_id not in self._context_restarted
+                    and self.pipeline
+                    and not self.pipeline.is_brainstorm_stage(task)
+                ):
+                    self._context_restarted.add(task.session_id)
+                    self.app.notify(
+                        f"{task.title} — context critical ({h.context_remaining}%), restarting",
+                        severity="warning",
+                    )
+                    self.app.bell()
+                    self._do_context_restart(task.id)
+                    changed = True
+                    continue
+
                 # Detect stage completion vs input waiting
                 if isinstance(backend, PtyBackend):
                     complete = backend.is_stage_complete(task.session_id)
@@ -301,9 +323,15 @@ class BoardScreen(Screen):
                     complete = False
                     waiting = False
                 if card.stage_complete != complete:
+                    if complete:
+                        self.app.notify(f"{task.title} — stage complete", severity="warning")
+                        self.app.bell()
                     card.stage_complete = complete
                     changed = True
                 if card.waiting_for_input != waiting:
+                    if waiting:
+                        self.app.notify(f"{task.title} — waiting for input")
+                        self.app.bell()
                     card.waiting_for_input = waiting
                     changed = True
 
@@ -547,6 +575,26 @@ class BoardScreen(Screen):
                         self.notify(f"Brainstorm: {agent_name} (cycle {cycle}/{stage.max_loops})")
         except Exception as e:
             self.notify(f"Brainstorm error: {e}", severity="error")
+
+    # --- Context restart ---
+
+    @work(exclusive=True, group="pipeline")
+    async def _do_context_restart(self, task_id: str) -> None:
+        try:
+            task = self._fresh_task(task_id)
+            if not task:
+                return
+            old_session = task.session_id
+            self.notify(f"Compressing context for {task.title}...")
+            updated = await self.pipeline.context_restart(task)
+            # Allow future auto-restarts (session_id is deterministic, same ID reused)
+            if old_session:
+                self._context_restarted.discard(old_session)
+            self._refresh_board()
+            self._follow_task(updated)
+            self.notify(f"Context restart complete: {updated.title}")
+        except Exception as e:
+            self.notify(f"Context restart error: {e}", severity="error", timeout=15)
 
     # --- Other actions ---
 

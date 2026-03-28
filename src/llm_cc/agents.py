@@ -293,12 +293,15 @@ class PtyBackend:
         model_flag = ""
         if config.model and "{model}" not in config.args_template:
             model_flag = f"--model {config.model}"
+        allowed_flag = ""
+        if config.allowed_tools and config.command == "claude":
+            allowed_flag = "--allowedTools " + shlex.quote(",".join(config.allowed_tools))
         cmd_args = config.args_template.format(
             prompt=shlex.quote(prompt),
             session_id=task.id,
             model=config.model or "",
         )
-        parts = [config.command, model_flag, cli_flags, cmd_args]
+        parts = [config.command, model_flag, allowed_flag, cli_flags, cmd_args]
         full_cmd = " ".join(p for p in parts if p).strip()
 
         # Log path

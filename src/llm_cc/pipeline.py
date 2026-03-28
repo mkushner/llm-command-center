@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 from .agents import AgentRegistry
@@ -14,6 +15,45 @@ from .models import (
     STAGE_ORDER,
 )
 from .storage import Storage
+
+
+async def _compress_log(log_text: str, task_title: str, stage: str) -> str:
+    """Compress a PTY session log into a structured summary using Haiku.
+
+    Returns markdown summary, or empty string if anthropic SDK unavailable.
+    """
+    try:
+        import anthropic
+    except ImportError:
+        return ""
+
+    # Truncate to last ~100k chars to stay within Haiku context
+    max_chars = 100_000
+    if len(log_text) > max_chars:
+        log_text = log_text[-max_chars:]
+
+    prompt = (
+        f"Summarize this coding agent session log for task: {task_title} (stage: {stage})\n\n"
+        "Produce a structured markdown summary:\n"
+        "## Completed Work\nWhat was accomplished (files modified, features implemented).\n"
+        "## Current State\nWhere the agent left off, what's partially done.\n"
+        "## Key Decisions\nImportant implementation decisions made.\n"
+        "## Errors Encountered\nErrors hit and resolution status.\n"
+        "## Next Steps\nWhat should be done next.\n\n"
+        "Be concise but preserve file paths, function names, and error messages.\n\n"
+        "--- SESSION LOG ---\n" + log_text
+    )
+
+    client = anthropic.AsyncAnthropic()
+    msg = await client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=2048,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    for block in msg.content:
+        if hasattr(block, "text"):
+            return block.text
+    return ""
 
 
 class PipelineEngine:
@@ -190,6 +230,7 @@ class PipelineEngine:
         can_resume = self._can_resume(task, next_status)
 
         # Save stage output and stop current agent (unless resuming)
+        prev_session_id = task.session_id
         if task.session_id:
             if task.status in (TaskStatus.PLANNING, TaskStatus.REVIEW):
                 await self._save_stage_output(task, task.status.value)
@@ -259,6 +300,11 @@ class PipelineEngine:
                         task.session_id = await backend.start(agent_config, task, prompt, self.git.project_path, stage="execute", cli_flags=flags)
 
                 case TaskStatus.REVIEW:
+                    # Compress execute log for review context
+                    if prev_session_id and task.status == TaskStatus.EXECUTE:
+                        await self._compress_session_for_next(
+                            task, prev_session_id, "execute-summary.md",
+                        )
                     if stage and stage.is_brainstorm:
                         task.sub_agent_idx = 0
                         task.loop_count = 0
@@ -382,13 +428,87 @@ class PipelineEngine:
         try:
             agent_config = self.config.agent_for_stage(task.status, task)
             backend = self.agents.backend_for(agent_config.name)
-            output = await backend.get_output(task.session_id)
+            output = await asyncio.wait_for(
+                backend.get_output(task.session_id), timeout=5.0,
+            )
             if output:
                 docs = self._task_docs_dir(task)
                 out_file = docs / f"{stage_name}-output.md"
                 out_file.write_text(output)
         except Exception:
             pass
+
+    # --- Context Compression ---
+
+    async def _compress_session_for_next(
+        self, task: Task, session_id: str, out_name: str,
+    ) -> None:
+        """Compress a session's PTY log and write to task docs."""
+        log_path = self.git.project_path / ".llm-cc" / "logs" / f"{session_id}.log"
+        if not log_path.exists():
+            return
+        try:
+            log_text = log_path.read_text(errors="replace")
+            if not log_text.strip():
+                return
+            summary = await _compress_log(log_text, task.title, task.status.value)
+            if summary:
+                docs = self._task_docs_dir(task)
+                (docs / out_name).write_text(summary)
+        except Exception:
+            pass
+
+    async def context_restart(self, task: Task) -> Task:
+        """Restart agent due to context pressure, with compressed session summary."""
+        if task.status not in (TaskStatus.PLANNING, TaskStatus.EXECUTE, TaskStatus.REVIEW):
+            return task
+
+        session_id = task.session_id
+        if task.session_id:
+            await self._stop_current_agent(task)
+
+        docs = self._ensure_task_docs(task)
+
+        # Compress log for continuity
+        if session_id:
+            await self._compress_session_for_next(
+                task, session_id, "context-summary.md",
+            )
+
+        plan_path = self._resolve_plan_path(task)
+        stage = self.config.stage_config(task.status)
+        agent_config = self.config.agent_for_stage(task.status, task)
+        backend = self.agents.backend_for(
+            agent_config.name, stage.mode_override if stage else None,
+        )
+        flags = stage.cli_flags if stage else ""
+
+        match task.status:
+            case TaskStatus.PLANNING:
+                prompt = self._build_planning_prompt(task, docs, plan_path)
+            case TaskStatus.EXECUTE:
+                prompt = self._build_execute_prompt(task, docs, plan_path)
+            case TaskStatus.REVIEW:
+                prompt = self._build_review_prompt(task, docs, plan_path)
+
+        # Append context references
+        docs_rel = self._docs_rel(docs)
+        handoff_path = docs / "handoff.md"
+        summary_path = docs / "context-summary.md"
+        if summary_path.exists():
+            prompt += f"\n\nContext summary from previous session: {docs_rel}/context-summary.md"
+        if handoff_path.exists():
+            prompt += f"\nSession handoff: {docs_rel}/handoff.md"
+        prompt += "\n\nRead the context summary first to continue where you left off."
+
+        task.session_id = await backend.start(
+            agent_config, task, prompt, self.git.project_path,
+            stage=task.status.value, cli_flags=flags,
+        )
+
+        task.touch()
+        self.storage.save_task(task)
+        return task
 
     # --- Brainstorm ---
 
@@ -497,7 +617,9 @@ class PipelineEngine:
         try:
             agent_config = self.config.agent_for_stage(task.status, task)
             backend = self.agents.backend_for(agent_config.name)
-            output = await backend.get_output(task.session_id)
+            output = await asyncio.wait_for(
+                backend.get_output(task.session_id), timeout=5.0,
+            )
             if output:
                 out_file.write_text(output)
         except Exception:
@@ -707,6 +829,10 @@ class PipelineEngine:
             f"Task description: {docs_rel}/task.md",
             f"Plan: {plan_rel}",
         ]
+        # Include execute summary if available
+        summary_file = docs / "execute-summary.md"
+        if summary_file.exists():
+            lines.append(f"Execute summary: {docs_rel}/execute-summary.md")
         if review_hint:
             lines.append(review_hint.rstrip())
         if task.verify:
