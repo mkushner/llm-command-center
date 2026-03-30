@@ -74,7 +74,7 @@ class TaskCard(Static, can_focus=False):
             lines.append("[bold yellow]WAITING FOR INPUT[/]")
         elif self.task_data.session_id:
             agent = self.task_data.agent_override or "agent"
-            parts = [f"[{agent}]"]
+            parts = [f"\\[{agent}]"]
             if self.health_score is not None:
                 parts.append(f"[{self.health_color}]{self.health_score}/100[/]")
             lines.append(" ".join(parts))
@@ -156,8 +156,7 @@ class KanbanColumn(VerticalScroll, can_focus=False):
     def _update_selection(self) -> None:
         for i, card in enumerate(self.query(TaskCard)):
             card.set_class(i == self._selected, "-selected")
-            if card.task_data.session_id:
-                card.set_class(True, "-has-agent")
+            card.set_class(bool(card.task_data.session_id), "-has-agent")
             card.set_class(card.is_stale, "-stale")
             card.set_class(card.stage_complete, "-stage-complete")
             card.set_class(card.waiting_for_input, "-waiting")

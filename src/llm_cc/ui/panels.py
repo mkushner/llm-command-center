@@ -19,6 +19,7 @@ class TaskInputDialog(ModalScreen[Task | None]):
 
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
+        Binding("ctrl+s", "save", "Save", priority=True),
     ]
 
     def __init__(self, task: Task | None = None) -> None:
@@ -82,6 +83,9 @@ class TaskInputDialog(ModalScreen[Task | None]):
         else:
             task = Task(title=title, description=desc, verify=verify, done=done)
             self.dismiss(task)
+
+    def action_save(self) -> None:
+        self._do_save()
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -147,9 +151,9 @@ class AgentPanel(ModalScreen[None]):
         with Vertical(id="agent-panel"):
             yield Static(f"Agent Session: {self._session_id}", classes="column-header")
             yield VerticalScroll(Static("Loading...", id="agent-output"), id="agent-scroll")
-            yield Static("", id="agent-status")
+            yield Static("[dim]waiting for agent status...[/]", id="agent-status")
             yield Static(
-                "[dim]All keys go to agent  |  [bold]Ctrl+C[/] interrupt  |  [bold]Ctrl+T[/] text input  |  [bold]Shift+PgUp/PgDn[/] scroll  |  [bold]Esc[/] close[/]",
+                "[dim]All keys go to agent  |  [bold]Ctrl+C[/] interrupt  |  [bold]Ctrl+V[/] paste  |  [bold]Ctrl+T[/] text input  |  [bold]Shift+PgUp/PgDn[/] scroll  |  [bold]Esc[/] close[/]",
                 id="agent-help",
             )
             yield Input(placeholder="Type message, press Enter to send (Esc to exit)...", id="agent-input")
@@ -226,6 +230,21 @@ class AgentPanel(ModalScreen[None]):
         # Send interrupt to agent
         if event.key == "ctrl+c":
             await self._send_raw("\x03")
+            event.prevent_default()
+            event.stop()
+            return
+
+        # Paste from clipboard
+        if event.key == "ctrl+v":
+            try:
+                import subprocess
+                clip = subprocess.run(
+                    ["pbpaste"], capture_output=True, text=True, timeout=2
+                )
+                if clip.returncode == 0 and clip.stdout:
+                    await self._send_raw(clip.stdout)
+            except Exception:
+                pass
             event.prevent_default()
             event.stop()
             return

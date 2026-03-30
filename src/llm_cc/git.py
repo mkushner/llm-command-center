@@ -141,9 +141,30 @@ class GitWorkspace:
         task.branch_name = branch
         return wt_path
 
+    async def _current_branch(self) -> str:
+        """Return the current branch name, or empty string if detached."""
+        result = await async_run(
+            ["git", "branch", "--show-current"],
+            cwd=self.project_path,
+            capture=True,
+            check=False,
+        )
+        return result.stdout.strip()
+
     async def _setup_branch(self, task: Task) -> Path:
-        """Branch-only mode. Lock prevents concurrent checkouts."""
+        """Branch-only mode. Lock prevents concurrent checkouts.
+
+        If already on a non-base branch, stay on it instead of creating a new one.
+        This supports the workflow where the user checks out a feature branch
+        before launching llm-cc.
+        """
         async with self._branch_lock:
+            current = await self._current_branch()
+            if current and current != self.config.base_branch:
+                # Already on a feature branch — use it as-is
+                task.branch_name = current
+                return self.project_path
+
             slug = task.slug()
             branch = f"{self.config.branch_prefix}{slug}"
             await async_run(

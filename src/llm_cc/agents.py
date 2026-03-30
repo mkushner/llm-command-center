@@ -155,22 +155,18 @@ class OutputBuffer:
                 bg_str = ""
                 bold = False
                 italic = False
-                underline = False
             else:
                 ch = char.data if char.data else " "
                 fg_str = self._pyte_color_to_rich(char.fg)
                 bg_str = self._pyte_color_to_rich(char.bg, background=True)
                 bold = char.bold
                 italic = char.italics
-                underline = char.underscore
 
             parts = [s for s in (fg_str, bg_str) if s]
             if bold:
                 parts.append("bold")
             if italic:
                 parts.append("italic")
-            if underline:
-                parts.append("underline")
             style = Style.parse(" ".join(parts)) if parts else Style.null()
 
             if style == span_style:

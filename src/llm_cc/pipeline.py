@@ -82,6 +82,21 @@ class PipelineEngine:
             agent_config = agent_config.model_copy(update={"allowed_tools": merged_tools})
         return agent_config
 
+    def _task_cwd(self, task: Task) -> Path:
+        """Working directory for agent: worktree path if available, else project root."""
+        if task.worktree_path:
+            wt = Path(task.worktree_path)
+            if wt.exists():
+                return wt
+        return self.git.project_path
+
+    def _in_worktree(self, task: Task) -> bool:
+        """True if this task runs inside a worktree (separate from project root)."""
+        if task.worktree_path:
+            wt = Path(task.worktree_path)
+            return wt.exists() and wt != self.git.project_path
+        return False
+
     def _task_docs_dir(self, task: Task) -> Path:
         """Per-task docs directory: .llm-cc/tasks/<id>/"""
         d = self.storage.llm_cc_dir / "tasks" / task.id
@@ -128,6 +143,8 @@ class PipelineEngine:
         if not plan_dir:
             raise RuntimeError("plan_dir resolved to empty string")
 
+        # Plan dir resolves against project root (default is .llm-cc/tasks/{id}).
+        # Worktree agents get absolute paths to reach it.
         full_dir = (self.git.project_path / plan_dir).resolve()
         if not full_dir.is_relative_to(self.git.project_path.resolve()):
             raise RuntimeError(
@@ -200,7 +217,7 @@ class PipelineEngine:
     def _build_resume_prompt(self, task: Task, next_status: TaskStatus, docs: Path) -> str:
         """Build a slim prompt for session resume (same agent, new stage)."""
         plan_path = self._resolve_plan_path(task)
-        plan_rel = self._plan_rel(plan_path)
+        plan_rel = self._plan_path_for_prompt(plan_path, task)
 
         match next_status:
             case TaskStatus.EXECUTE:
@@ -293,7 +310,7 @@ class PipelineEngine:
                         plan_path = self._resolve_plan_path(task)
                         prompt = self._build_planning_prompt(task, docs, plan_path)
                         backend = self.agents.backend_for(agent_config.name, stage.mode_override if stage else None)
-                        task.session_id = await backend.start(agent_config, task, prompt, self.git.project_path, stage="planning", cli_flags=flags)
+                        task.session_id = await backend.start(agent_config, task, prompt, self._task_cwd(task), stage="planning", cli_flags=flags)
 
                 case TaskStatus.EXECUTE:
                     # No directory isolation — only one task in Execute at a time
@@ -314,7 +331,7 @@ class PipelineEngine:
                         plan_path = self._resolve_plan_path(task)
                         prompt = self._build_execute_prompt(task, docs, plan_path)
                         backend = self.agents.backend_for(agent_config.name, stage.mode_override if stage else None)
-                        task.session_id = await backend.start(agent_config, task, prompt, self.git.project_path, stage="execute", cli_flags=flags)
+                        task.session_id = await backend.start(agent_config, task, prompt, self._task_cwd(task), stage="execute", cli_flags=flags)
 
                 case TaskStatus.REVIEW:
                     # Compress execute log for review context
@@ -331,7 +348,7 @@ class PipelineEngine:
                         plan_path = self._resolve_plan_path(task)
                         prompt = self._build_review_prompt(task, docs, plan_path)
                         backend = self.agents.backend_for(agent_config.name, stage.mode_override if stage else None)
-                        task.session_id = await backend.start(agent_config, task, prompt, self.git.project_path, stage="review", cli_flags=flags)
+                        task.session_id = await backend.start(agent_config, task, prompt, self._task_cwd(task), stage="review", cli_flags=flags)
 
                 case TaskStatus.DONE:
                     task.session_id = None
@@ -393,10 +410,10 @@ class PipelineEngine:
         # Include handoff context if available from previous run
         handoff_path = docs / "handoff.md"
         if handoff_path.exists():
-            docs_rel = self._docs_rel(docs)
+            docs_rel = self._docs_path_for_prompt(docs, task)
             prompt += f"\n\nPrevious session handoff: {docs_rel}/handoff.md"
 
-        task.session_id = await backend.start(agent_config, task, prompt, self.git.project_path, stage=task.status.value, cli_flags=flags)
+        task.session_id = await backend.start(agent_config, task, prompt, self._task_cwd(task), stage=task.status.value, cli_flags=flags)
 
         task.touch()
         self.storage.save_task(task)
@@ -509,7 +526,7 @@ class PipelineEngine:
                 prompt = self._build_review_prompt(task, docs, plan_path)
 
         # Append context references
-        docs_rel = self._docs_rel(docs)
+        docs_rel = self._docs_path_for_prompt(docs, task)
         handoff_path = docs / "handoff.md"
         summary_path = docs / "context-summary.md"
         if summary_path.exists():
@@ -519,7 +536,7 @@ class PipelineEngine:
         prompt += "\n\nRead the context summary first to continue where you left off."
 
         task.session_id = await backend.start(
-            agent_config, task, prompt, self.git.project_path,
+            agent_config, task, prompt, self._task_cwd(task),
             stage=task.status.value, cli_flags=flags,
         )
 
@@ -619,7 +636,7 @@ class PipelineEngine:
         prompt = self._build_brainstorm_prompt(task, agent_name, stage, docs)
         session_stage = f"{stage.stage.value}_{agent_name}_c{task.loop_count}"
         task.session_id = await backend.start(
-            agent_config, task, prompt, self.git.project_path,
+            agent_config, task, prompt, self._task_cwd(task),
             stage=session_stage, cli_flags=stage.effective_cli_flags,
         )
 
@@ -677,7 +694,7 @@ class PipelineEngine:
         The agent already has prior context — only point it at the latest
         output file from the other participant(s).
         """
-        docs_rel = self._docs_rel(docs)
+        docs_rel = self._docs_path_for_prompt(docs, task)
         cycle = task.loop_count + 1  # 1-based for display
         total = stage.max_loops
 
@@ -723,14 +740,17 @@ class PipelineEngine:
         backend = self.agents.backend_for(agent_config.name, stage.mode_override)
         session_stage = f"{stage.stage.value}_summarizer"
         task.session_id = await backend.start(
-            agent_config, task, prompt, self.git.project_path,
+            agent_config, task, prompt, self._task_cwd(task),
             stage=session_stage, cli_flags=stage.effective_cli_flags,
         )
 
     def _build_summary_prompt(self, task: Task, stage, docs: Path, summary_dir: Path) -> str:
         """Build prompt for the brainstorm summarizer."""
-        docs_rel = self._docs_rel(docs)
-        summary_rel = str(summary_dir.relative_to(self.git.project_path))
+        docs_rel = self._docs_path_for_prompt(docs, task)
+        if self._in_worktree(task):
+            summary_rel = str(summary_dir)
+        else:
+            summary_rel = str(summary_dir.relative_to(self.git.project_path))
 
         cycle_files = sorted(
             f.name for f in docs.glob("*-cycle*.md")
@@ -768,7 +788,7 @@ class PipelineEngine:
 
     def _build_brainstorm_prompt(self, task: Task, agent_name: str, stage, docs: Path) -> str:
         """Build prompt for a brainstorm sub-agent with cycle context."""
-        docs_rel = self._docs_rel(docs)
+        docs_rel = self._docs_path_for_prompt(docs, task)
         cycle = task.loop_count + 1  # 1-based for display
         total = stage.max_loops
 
@@ -804,17 +824,30 @@ class PipelineEngine:
 
     # --- Prompt Building ---
 
-    def _plan_rel(self, plan_path: Path) -> str:
-        """Get plan file path relative to project root."""
+    def _plan_path_for_prompt(self, plan_path: Path, task: Task) -> str:
+        """Plan file path as the agent will see it.
+
+        Default plan_dir is .llm-cc/tasks/{id} (in the main tree, not worktree).
+        Worktree agents need absolute paths. If user configures plan_dir outside
+        .llm-cc/ (e.g. plans/{branch}), it's still under project root.
+        """
+        if self._in_worktree(task):
+            return str(plan_path)
         return str(plan_path.relative_to(self.git.project_path))
 
-    def _docs_rel(self, docs: Path) -> str:
-        """Get docs dir path relative to project root."""
+    def _docs_path_for_prompt(self, docs: Path, task: Task) -> str:
+        """Docs dir path as the agent will see it.
+
+        Task docs live in the main tree's .llm-cc/ (not in the worktree),
+        so worktree agents need absolute paths to reach them.
+        """
+        if self._in_worktree(task):
+            return str(docs)
         return str(docs.relative_to(self.git.project_path))
 
     def _build_planning_prompt(self, task: Task, docs: Path, plan_path: Path) -> str:
-        docs_rel = self._docs_rel(docs)
-        plan_rel = self._plan_rel(plan_path)
+        docs_rel = self._docs_path_for_prompt(docs, task)
+        plan_rel = self._plan_path_for_prompt(plan_path, task)
         return (
             f"PLANNING: {task.title}\n\n"
             f"Task description: {docs_rel}/task.md\n"
@@ -823,8 +856,8 @@ class PipelineEngine:
         )
 
     def _build_execute_prompt(self, task: Task, docs: Path, plan_path: Path) -> str:
-        docs_rel = self._docs_rel(docs)
-        plan_rel = self._plan_rel(plan_path)
+        docs_rel = self._docs_path_for_prompt(docs, task)
+        plan_rel = self._plan_path_for_prompt(plan_path, task)
         lines = [
             f"EXECUTE: {task.title}",
             "",
@@ -839,12 +872,15 @@ class PipelineEngine:
         return "\n".join(lines)
 
     def _build_review_prompt(self, task: Task, docs: Path, plan_path: Path) -> str:
-        docs_rel = self._docs_rel(docs)
-        plan_rel = self._plan_rel(plan_path)
+        docs_rel = self._docs_path_for_prompt(docs, task)
+        plan_rel = self._plan_path_for_prompt(plan_path, task)
         review_hint = ""
         if self.config.project.review_file:
             review_path = plan_path.parent / self.config.project.review_file
-            review_rel = str(review_path.relative_to(self.git.project_path))
+            if self._in_worktree(task):
+                review_rel = str(review_path)
+            else:
+                review_rel = str(review_path.relative_to(self.git.project_path))
             review_hint = f"Write your review to: {review_rel}\n"
         lines = [
             f"REVIEW: {task.title}",
