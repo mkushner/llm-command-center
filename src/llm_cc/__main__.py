@@ -3,26 +3,77 @@
 from __future__ import annotations
 
 import sys
+import tomllib
 from pathlib import Path
 
 
+def _import_tasks(storage: object, tasks_path: Path) -> int:
+    """Import tasks from a TOML file into BACKLOG. Returns count of imported tasks."""
+    from llm_cc.models import Task
+
+    with open(tasks_path, "rb") as f:
+        data = tomllib.load(f)
+
+    task_list = data.get("task", [])
+    if not isinstance(task_list, list):
+        task_list = [task_list]
+
+    store = storage.load_tasks()
+    existing_titles = {t.title for t in store.tasks}
+    count = 0
+    for entry in task_list:
+        title = entry.get("title", "").strip()
+        if not title:
+            continue
+        if title in existing_titles:
+            continue  # skip duplicates by title
+        task = Task(
+            title=title,
+            description=entry.get("description"),
+            verify=entry.get("verify"),
+            done=entry.get("done"),
+        )
+        store.upsert(task)
+        existing_titles.add(title)
+        count += 1
+    if count:
+        storage.save_tasks(store)
+    return count
+
+
 def main() -> None:
-    # Determine project path: argument or current directory
-    if len(sys.argv) > 1 and sys.argv[1] not in ("--help", "-h", "--version"):
-        project_path = Path(sys.argv[1]).resolve()
+    args = sys.argv[1:]
+    tasks_file: str | None = None
+
+    # Extract --tasks flag
+    if "--tasks" in args:
+        idx = args.index("--tasks")
+        if idx + 1 < len(args):
+            tasks_file = args[idx + 1]
+            args = args[:idx] + args[idx + 2:]
+        else:
+            print("Error: --tasks requires a file path", file=sys.stderr)
+            sys.exit(1)
+
+    # Determine project path: first positional arg or cwd
+    if args and args[0] not in ("--help", "-h", "--version"):
+        project_path = Path(args[0]).resolve()
     else:
         project_path = Path.cwd()
 
-    if "--version" in sys.argv:
+    if "--version" in args:
         from llm_cc import __version__
 
         print(f"llm-cc {__version__}")
         return
 
-    if "--help" in sys.argv or "-h" in sys.argv:
-        print("Usage: llm-cc [project-path]")
+    if "--help" in args or "-h" in args:
+        print("Usage: llm-cc [project-path] [--tasks tasks.toml]")
         print("  Launch the LLM Command Center TUI for the given project.")
         print("  Defaults to current directory if no path given.")
+        print("")
+        print("Options:")
+        print("  --tasks FILE  Import tasks from a TOML file into BACKLOG")
         return
 
     # Ensure project path exists
@@ -37,6 +88,23 @@ def main() -> None:
     storage.ensure_dirs()
     storage.ensure_gitignore()
     storage.update_recent_projects(str(project_path))
+
+    # Import tasks if --tasks specified or .llm-cc/tasks.toml exists
+    if tasks_file:
+        tasks_path = Path(tasks_file).resolve()
+        if not tasks_path.is_file():
+            print(f"Error: tasks file not found: {tasks_path}", file=sys.stderr)
+            sys.exit(1)
+        count = _import_tasks(storage, tasks_path)
+        if count:
+            print(f"Imported {count} task{'s' if count != 1 else ''} from {tasks_path.name}")
+    else:
+        # Auto-detect .llm-cc/tasks.toml
+        auto_tasks = project_path / ".llm-cc" / "tasks.toml"
+        if auto_tasks.is_file():
+            count = _import_tasks(storage, auto_tasks)
+            if count:
+                print(f"Imported {count} task{'s' if count != 1 else ''} from .llm-cc/tasks.toml")
 
     from llm_cc.app import CommandCenterApp
 

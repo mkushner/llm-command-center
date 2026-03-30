@@ -120,8 +120,18 @@ class PipelineStage(BaseModel):
     summarizer: str = ""                  # agent that writes final summary after all loops
     mode_override: AgentMode | None = None
     prompt_template: str | None = None
-    cli_flags: str = ""  # extra CLI flags for this stage (e.g. "--dangerously-skip-permissions")
-    auto: bool = False
+    cli_flags: str = ""  # extra CLI flags for this stage
+    skip_permissions: bool = False  # inject --dangerously-skip-permissions for this stage
+    allowed_tools: list[str] = []   # additional auto-approved tools (merged with agent defaults)
+    auto: bool = False  # auto-advance to next stage when agent reports completion
+
+    @property
+    def effective_cli_flags(self) -> str:
+        """CLI flags with skip_permissions injected if enabled."""
+        parts = [self.cli_flags] if self.cli_flags else []
+        if self.skip_permissions and "--dangerously-skip-permissions" not in self.cli_flags:
+            parts.append("--dangerously-skip-permissions")
+        return " ".join(parts)
 
     @model_validator(mode="after")
     def _check_agent_or_agents(self) -> PipelineStage:

@@ -73,6 +73,15 @@ class PipelineEngine:
         # Parked brainstorm sessions: task_id → {sub_agent_idx: session_id}
         self._brainstorm_sessions: dict[str, dict[int, str]] = {}
 
+    def _agent_config_for_stage(self, status: TaskStatus, task: Task):
+        """Resolve agent config with per-stage allowed_tools merged in."""
+        agent_config = self.config.agent_for_stage(status, task)
+        stage = self.config.stage_config(status)
+        if stage and stage.allowed_tools:
+            merged_tools = list(dict.fromkeys(agent_config.allowed_tools + stage.allowed_tools))
+            agent_config = agent_config.model_copy(update={"allowed_tools": merged_tools})
+        return agent_config
+
     def _task_docs_dir(self, task: Task) -> Path:
         """Per-task docs directory: .llm-cc/tasks/<id>/"""
         d = self.storage.llm_cc_dir / "tasks" / task.id
@@ -131,7 +140,7 @@ class PipelineEngine:
         """Check if current session can be reused for the next stage.
 
         Conditions: same agent, same backend mode, same cli_flags,
-        same mode_override, process alive, not brainstorm, not DONE.
+        same allowed_tools, process alive, not brainstorm, not DONE.
         """
         if not task.session_id:
             return False
@@ -162,9 +171,17 @@ class PipelineEngine:
             return False
 
         # Same cli_flags
-        current_flags = current_stage.cli_flags if current_stage else ""
-        next_flags = next_stage.cli_flags if next_stage else ""
+        current_flags = current_stage.effective_cli_flags if current_stage else ""
+        next_flags = next_stage.effective_cli_flags if next_stage else ""
         if current_flags != next_flags:
+            return False
+
+        # Same effective allowed_tools
+        cur_extra = current_stage.allowed_tools if current_stage else []
+        nxt_extra = next_stage.allowed_tools if next_stage else []
+        current_tools = sorted(set(current_agent.allowed_tools + cur_extra))
+        next_tools = sorted(set(next_agent.allowed_tools + nxt_extra))
+        if current_tools != next_tools:
             return False
 
         # Process must be alive
@@ -260,8 +277,8 @@ class PipelineEngine:
         else:
             # Normal flow: stop was already done above, start new agent
             stage = self.config.stage_config(next_status)
-            agent_config = self.config.agent_for_stage(next_status, task)
-            flags = stage.cli_flags if stage else ""
+            agent_config = self._agent_config_for_stage(next_status, task)
+            flags = stage.effective_cli_flags if stage else ""
             docs = self._ensure_task_docs(task)
 
             match next_status:
@@ -361,9 +378,9 @@ class PipelineEngine:
         docs = self._ensure_task_docs(task)
         plan_path = self._resolve_plan_path(task)
         stage = self.config.stage_config(task.status)
-        agent_config = self.config.agent_for_stage(task.status, task)
+        agent_config = self._agent_config_for_stage(task.status, task)
         backend = self.agents.backend_for(agent_config.name, stage.mode_override if stage else None)
-        flags = stage.cli_flags if stage else ""
+        flags = stage.effective_cli_flags if stage else ""
 
         match task.status:
             case TaskStatus.PLANNING:
@@ -477,11 +494,11 @@ class PipelineEngine:
 
         plan_path = self._resolve_plan_path(task)
         stage = self.config.stage_config(task.status)
-        agent_config = self.config.agent_for_stage(task.status, task)
+        agent_config = self._agent_config_for_stage(task.status, task)
         backend = self.agents.backend_for(
             agent_config.name, stage.mode_override if stage else None,
         )
-        flags = stage.cli_flags if stage else ""
+        flags = stage.effective_cli_flags if stage else ""
 
         match task.status:
             case TaskStatus.PLANNING:
@@ -578,6 +595,9 @@ class PipelineEngine:
         """Spawn the current brainstorm sub-agent, resuming a parked session if available."""
         agent_name = stage.agent_at(task.sub_agent_idx)
         agent_config = self.config.agents[agent_name]
+        if stage.allowed_tools:
+            merged = list(dict.fromkeys(agent_config.allowed_tools + stage.allowed_tools))
+            agent_config = agent_config.model_copy(update={"allowed_tools": merged})
         backend = self.agents.backend_for(agent_config.name, stage.mode_override)
 
         # Check for parked session from a previous cycle
@@ -600,7 +620,7 @@ class PipelineEngine:
         session_stage = f"{stage.stage.value}_{agent_name}_c{task.loop_count}"
         task.session_id = await backend.start(
             agent_config, task, prompt, self.git.project_path,
-            stage=session_stage, cli_flags=stage.cli_flags,
+            stage=session_stage, cli_flags=stage.effective_cli_flags,
         )
 
     async def _save_brainstorm_output(self, task: Task, agent_name: str, cycle: int) -> None:
@@ -693,6 +713,9 @@ class PipelineEngine:
         """Spawn the summarizer agent after all brainstorm loops."""
         task.brainstorm_summarizing = True
         agent_config = self.config.agents[stage.summarizer]
+        if stage.allowed_tools:
+            merged = list(dict.fromkeys(agent_config.allowed_tools + stage.allowed_tools))
+            agent_config = agent_config.model_copy(update={"allowed_tools": merged})
         docs = self._task_docs_dir(task)
         summary_dir = self.git.project_path / "brainstorm" / task.id
         summary_dir.mkdir(parents=True, exist_ok=True)
@@ -701,7 +724,7 @@ class PipelineEngine:
         session_stage = f"{stage.stage.value}_summarizer"
         task.session_id = await backend.start(
             agent_config, task, prompt, self.git.project_path,
-            stage=session_stage, cli_flags=stage.cli_flags,
+            stage=session_stage, cli_flags=stage.effective_cli_flags,
         )
 
     def _build_summary_prompt(self, task: Task, stage, docs: Path, summary_dir: Path) -> str:

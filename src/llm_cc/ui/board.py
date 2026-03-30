@@ -324,6 +324,15 @@ class BoardScreen(Screen):
                     waiting = False
                 if card.stage_complete != complete:
                     if complete:
+                        # Auto-advance if stage.auto is enabled
+                        stage_cfg = self._config.stage_config(task.status)
+                        if stage_cfg and stage_cfg.auto and self.pipeline:
+                            self.app.notify(
+                                f"{task.title} — auto-advancing from {task.status.value}",
+                            )
+                            self._do_advance(task.id)
+                            changed = True
+                            continue
                         self.app.notify(f"{task.title} — stage complete", severity="warning")
                         self.app.bell()
                     card.stage_complete = complete
