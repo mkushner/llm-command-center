@@ -68,6 +68,16 @@ class Storage:
                 data = json.load(f)
             return TaskStore.model_validate(data)
         except Exception:
+            # Backup corrupted file before returning empty store
+            import time as _time
+
+            backup = self.tasks_file.with_suffix(f".corrupt.{int(_time.time())}.json")
+            try:
+                import shutil as _shutil
+
+                _shutil.copy2(str(self.tasks_file), str(backup))
+            except Exception:
+                pass
             return TaskStore()
 
     def _write_store(self, store: TaskStore) -> None:

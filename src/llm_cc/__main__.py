@@ -18,6 +18,7 @@ def _import_tasks(storage: object, tasks_path: Path) -> int:
     if not isinstance(task_list, list):
         task_list = [task_list]
 
+    # Read existing titles for dedup (snapshot is fine — import runs at startup)
     store = storage.load_tasks()
     existing_titles = {t.title for t in store.tasks}
     count = 0
@@ -33,11 +34,10 @@ def _import_tasks(storage: object, tasks_path: Path) -> int:
             verify=entry.get("verify"),
             done=entry.get("done"),
         )
-        store.upsert(task)
+        # Atomic per-task upsert (read-modify-write under one lock)
+        storage.save_task(task)
         existing_titles.add(title)
         count += 1
-    if count:
-        storage.save_tasks(store)
     return count
 
 

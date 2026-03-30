@@ -109,10 +109,8 @@ class CommandCenterApp(App):
     def _cleanup_stale_sessions(self) -> None:
         """Clear session_id from tasks whose processes are no longer running."""
         store = self.storage.load_tasks()
-        changed = False
         for task in store.tasks:
             if task.session_id and task.status in (TaskStatus.PLANNING, TaskStatus.EXECUTE, TaskStatus.REVIEW):
-                # Check if any backend recognizes this session as alive
                 alive = False
                 try:
                     agent_config = self._config.agent_for_stage(task.status, task)
@@ -122,9 +120,8 @@ class CommandCenterApp(App):
                     pass
                 if not alive:
                     task.session_id = None
-                    changed = True
-        if changed:
-            self.storage.save_tasks(store)
+                    # Atomic per-task save (no full-store overwrite)
+                    self.storage.save_task(task)
 
     async def on_unmount(self) -> None:
         if self.registry.session_store:

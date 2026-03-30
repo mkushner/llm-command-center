@@ -714,6 +714,10 @@ class _ProcessManager:
             try:
                 if hasattr(child, "isalive") and child.isalive():
                     child.terminate(force=True)
+                    try:
+                        child.wait()
+                    except Exception:
+                        pass
             except Exception:
                 pass
         self._children.clear()

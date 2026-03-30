@@ -94,31 +94,23 @@ class GitWorkspace:
         wt_path = self.project_path / ".llm-cc" / "worktrees" / slug
         branch = f"{self.config.branch_prefix}{slug}"
 
-        # Remove stale worktree if exists (git command first, then force-delete dir)
-        if wt_path.exists():
-            await async_run(
-                ["git", "worktree", "remove", "--force", str(wt_path)],
-                cwd=self.project_path,
-                check=False,
-            )
-        if wt_path.exists():
+        # If worktree already exists and is valid, reuse it (preserves uncommitted work)
+        if wt_path.exists() and (wt_path / ".git").exists():
+            task.worktree_path = str(wt_path)
+            task.branch_name = branch
+            return wt_path
+        # Clean up invalid/empty worktree directory
+        if wt_path.exists() and not (wt_path / ".git").exists():
             shutil.rmtree(str(wt_path), ignore_errors=True)
 
-        # Prune stale worktree refs (so branch delete works)
+        # Prune stale worktree refs (so branch operations work)
         await async_run(
             ["git", "worktree", "prune"],
             cwd=self.project_path,
             check=False,
         )
 
-        # Clean stale branch if exists
-        await async_run(
-            ["git", "branch", "-D", branch],
-            cwd=self.project_path,
-            check=False,
-        )
-
-        # Create worktree
+        # Try to create worktree with new branch
         result = await async_run(
             ["git", "worktree", "add", str(wt_path), "-b", branch, self.config.base_branch],
             cwd=self.project_path,
@@ -126,13 +118,16 @@ class GitWorkspace:
             capture=True,
         )
         if result.returncode != 0:
-            # If branch exists but worktree doesn't, reuse the branch
             if "already exists" in result.stderr:
-                await async_run(
+                # Branch exists but no worktree — reuse the branch
+                result2 = await async_run(
                     ["git", "worktree", "add", str(wt_path), branch],
                     cwd=self.project_path,
+                    check=False,
                     capture=True,
                 )
+                if result2.returncode != 0:
+                    raise RuntimeError(f"git worktree add failed: {result2.stderr.strip()}")
             else:
                 raise RuntimeError(f"git worktree add failed: {result.stderr.strip()}")
 
@@ -219,21 +214,42 @@ class GitWorkspace:
         return [f for f in result.stdout.strip().splitlines() if f]
 
     async def cleanup(self, task: Task) -> None:
-        """Remove worktree and prune. Keeps branch for history."""
+        """Remove worktree and prune. Keeps branch for history.
+
+        Uses non-force remove first to protect uncommitted changes.
+        Falls back to --force only if the worktree directory is already gone.
+        """
         if not self._git_enabled:
             return
         if task.worktree_path:
-            await async_run(
-                ["git", "worktree", "remove", "--force", task.worktree_path],
+            removed = False
+            # Try clean removal (fails if uncommitted changes exist — that's intentional)
+            result = await async_run(
+                ["git", "worktree", "remove", task.worktree_path],
                 cwd=self.project_path,
                 check=False,
+                capture=True,
             )
+            if result.returncode == 0:
+                removed = True
+            else:
+                wt = Path(task.worktree_path)
+                if not wt.exists():
+                    # Directory already gone — force-remove the worktree ref
+                    await async_run(
+                        ["git", "worktree", "remove", "--force", task.worktree_path],
+                        cwd=self.project_path,
+                        check=False,
+                    )
+                    removed = True
+                # else: uncommitted changes — leave the worktree intact
             await async_run(
                 ["git", "worktree", "prune"],
                 cwd=self.project_path,
                 check=False,
             )
-            task.worktree_path = None
+            if removed:
+                task.worktree_path = None
 
 
 class PRManager:
@@ -254,11 +270,18 @@ class PRManager:
         await async_run(["git", "add", "-A"], cwd=cwd)
 
         commit_msg = f"{title}\n\n{body}"
-        await async_run(
+        commit_result = await async_run(
             ["git", "commit", "-m", commit_msg],
             cwd=cwd,
             check=False,
+            capture=True,
         )
+        if commit_result.returncode != 0:
+            stderr = commit_result.stderr.strip()
+            stdout = commit_result.stdout.strip()
+            # "nothing to commit" is acceptable — push whatever is on the branch
+            if "nothing to commit" not in stdout and "nothing to commit" not in stderr:
+                raise RuntimeError(f"git commit failed: {stderr or stdout}")
 
         if not task.branch_name:
             raise ValueError("Task has no branch — cannot push")

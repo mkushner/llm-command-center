@@ -210,6 +210,7 @@ class BoardScreen(Screen):
         self._columns: list[KanbanColumn] = []
         self._poll_timer = None
         self._context_restarted: set[str] = set()  # session_ids already auto-restarted
+        self._inflight_tasks: set[str] = set()  # task_ids with a queued pipeline op
 
     def compose(self) -> ComposeResult:
         yield Static(
@@ -268,7 +269,7 @@ class BoardScreen(Screen):
                         backend.is_waiting_for_input(task.session_id)
                         or backend.is_stage_complete(task.session_id)
                     )
-                    if dead or idle:
+                    if (dead or idle) and task.id not in self._inflight_tasks:
                         self._do_brainstorm_advance(task.id)
                         changed = True
                         continue
@@ -325,7 +326,10 @@ class BoardScreen(Screen):
                     if complete:
                         # Auto-advance if stage.auto is enabled
                         stage_cfg = self._config.stage_config(task.status)
-                        if stage_cfg and stage_cfg.auto and self.pipeline:
+                        if (
+                            stage_cfg and stage_cfg.auto and self.pipeline
+                            and task.id not in self._inflight_tasks
+                        ):
                             self.app.notify(
                                 f"{task.title} — auto-advancing from {task.status.value}",
                             )
@@ -476,6 +480,7 @@ class BoardScreen(Screen):
 
     @work(exclusive=True, group="pipeline")
     async def _do_advance(self, task_id: str) -> None:
+        self._inflight_tasks.add(task_id)
         try:
             task = self._fresh_task(task_id)
             if not task:
@@ -493,6 +498,8 @@ class BoardScreen(Screen):
             self.notify("Advance cancelled (worker conflict)", severity="warning")
         except Exception as e:
             self.notify(f"Advance error: {e}", severity="error", timeout=15)
+        finally:
+            self._inflight_tasks.discard(task_id)
 
     # --- b: Back (revert) ---
 
@@ -562,8 +569,9 @@ class BoardScreen(Screen):
 
     # --- Brainstorm auto-advance ---
 
-    @work(exclusive=True, group="brainstorm")
+    @work(exclusive=True, group="pipeline")
     async def _do_brainstorm_advance(self, task_id: str) -> None:
+        self._inflight_tasks.add(task_id)
         try:
             task = self._fresh_task(task_id)
             if not task:
@@ -583,11 +591,14 @@ class BoardScreen(Screen):
                         self.notify(f"Brainstorm: {agent_name} (cycle {cycle}/{stage.max_loops})")
         except Exception as e:
             self.notify(f"Brainstorm error: {e}", severity="error")
+        finally:
+            self._inflight_tasks.discard(task_id)
 
     # --- Context restart ---
 
     @work(exclusive=True, group="pipeline")
     async def _do_context_restart(self, task_id: str) -> None:
+        old_session = None
         try:
             task = self._fresh_task(task_id)
             if not task:
@@ -595,14 +606,15 @@ class BoardScreen(Screen):
             old_session = task.session_id
             self.notify(f"Compressing context for {task.title}...")
             updated = await self.pipeline.context_restart(task)
-            # Allow future auto-restarts (session_id is deterministic, same ID reused)
-            if old_session:
-                self._context_restarted.discard(old_session)
             self._refresh_board()
             self._follow_task(updated)
             self.notify(f"Context restart complete: {updated.title}")
         except Exception as e:
             self.notify(f"Context restart error: {e}", severity="error", timeout=15)
+        finally:
+            # Always clear the guard so future auto-restarts can trigger
+            if old_session:
+                self._context_restarted.discard(old_session)
 
     # --- Other actions ---
 
