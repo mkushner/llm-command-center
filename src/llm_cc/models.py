@@ -180,7 +180,7 @@ class ProjectConfig(BaseModel):
     plan_dir: str = ".llm-cc/tasks/{id}"  # template: {id}, {slug}, {branch}, {title}
     plan_file: str = "plan.md"  # constant filename within plan_dir
     review_file: str | None = None  # optional: where review agent writes summary (resolved in plan_dir)
-    context_restart_threshold: int = 10  # auto-restart at this % remaining (0 disables)
+    context_restart_threshold: int = 0  # auto-restart at this % remaining (0 = disabled, trust agent's internal compaction)
 
 
 class GlobalConfig(BaseModel):

@@ -80,14 +80,15 @@ class TaskCard(Static, can_focus=False):
             lines.append(" ".join(parts))
             if self.top_error:
                 lines.append(f"[bold red][!] {self.top_error}[/]")
-            status_parts: list[str] = []
-            if self.context_remaining is not None and self.context_color:
-                status_parts.append(f"[{self.context_color}]{self.context_remaining}% ctx[/]")
+            if self.context_remaining is not None:
+                filled = self.context_remaining // 10
+                bar = "█" * filled + "░" * (10 - filled)
+                color = self.context_color or "green"
+                bold = "bold " if color != "green" else ""
+                lines.append(f"[{bold}{color}]{bar} {self.context_remaining}%[/]")
             if self.total_tokens is not None:
                 tk = self.total_tokens / 1000
-                status_parts.append(f"[dim]{tk:.0f}k tokens[/]")
-            if status_parts:
-                lines.append(" | ".join(status_parts))
+                lines.append(f"[dim]{tk:.0f}k tokens[/]")
         return "\n".join(lines)
 
 

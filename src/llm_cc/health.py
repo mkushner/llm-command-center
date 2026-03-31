@@ -134,8 +134,25 @@ class ContextMonitor:
                     self.context_percent = pct
 
     def update_from_status(self, status_data: dict) -> None:
-        """Update from Claude Code statusline JSON — overrides screen scraping."""
+        """Update from Claude Code statusline JSON — overrides screen scraping.
+
+        Computes used % from raw token counts when available.  Falls back to the
+        reported used_percentage which may lag behind actual usage.
+        """
         ctx = status_data.get("context_window", {})
+        window_size = ctx.get("context_window_size")
+        usage = ctx.get("current_usage") or {}
+        inp = usage.get("input_tokens") or 0
+        cache_cr = usage.get("cache_creation_input_tokens") or 0
+        cache_rd = usage.get("cache_read_input_tokens") or 0
+        total_input = inp + cache_cr + cache_rd
+
+        if window_size and total_input > 0:
+            used = min(int(total_input * 100 / window_size), 100)
+            self.context_percent = used
+            return
+
+        # Fallback: use reported percentage (less accurate)
         used = ctx.get("used_percentage")
         if used is not None and 0 <= used <= 100:
             self.context_percent = used

@@ -17,8 +17,27 @@ def test_update_from_status_sets_context():
     """update_from_status sets context_percent from statusline JSON."""
     mon = ContextMonitor()
     mon.update_from_status({"context_window": {"used_percentage": 45}})
-    assert mon.context_percent == 45
+    assert mon.context_percent == 45  # fallback to used_percentage when no raw tokens
     assert mon.remaining == 55
+
+
+def test_update_from_status_raw_tokens():
+    """Computes used% from raw tokens with 64k output reservation."""
+    mon = ContextMonitor()
+    mon.update_from_status({
+        "context_window": {
+            "context_window_size": 200_000,
+            "used_percentage": 8,  # inaccurate official value — should be ignored
+            "current_usage": {
+                "input_tokens": 8500,
+                "cache_creation_input_tokens": 5000,
+                "cache_read_input_tokens": 2000,
+            },
+        },
+    })
+    # (8500 + 5000 + 2000) / 200000 = 15500 / 200000 ≈ 7%
+    assert mon.context_percent == 7
+    assert mon.remaining == 93
 
 
 def test_update_from_status_ignores_invalid():

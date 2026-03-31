@@ -89,7 +89,7 @@ The card shows `[agent] 85/100` with color coding: green (>=75), yellow (>=50), 
 
 **Context monitoring** parses `XX% of context` patterns from agent output. Shows `[ctx 25%]` when remaining context drops below 30% (yellow) or 10% (red).
 
-**Auto context restart** — when remaining context drops to a critical threshold (default 10%), the agent is automatically stopped, its session log is compressed into a structured summary via Haiku API, and the agent is restarted with the summary as context. The compressed summary includes: completed work, current state, key decisions, errors, and next steps. If the Anthropic SDK is not installed, the restart still happens using the handoff file only. Configure with `context_restart_threshold` in project config (set to 0 to disable).
+**Auto context restart** — disabled by default. Agents like Claude Code have built-in context compaction that handles context pressure internally — external restarts are more disruptive and should only be used for agents without internal compaction. When enabled (`context_restart_threshold > 0`), the agent is stopped when remaining context drops to the threshold, its session log is compressed into a structured summary via Haiku API, and the agent is restarted with the summary as context. The compressed summary includes: completed work, current state, key decisions, errors, and next steps. If the Anthropic SDK is not installed, the restart still happens using the handoff file only.
 
 **Session persistence** — each session maintains a ring buffer (50 events max) of output, errors, and health snapshots. Persisted to `.llm-cc/sessions/{session_id}.json` with 3s debounce. Session files older than 7 days are automatically cleaned up on startup. On agent stop, a human-readable `handoff.md` is generated in the task docs directory with position, recent activity, errors, and context status. On restart, the agent prompt references the handoff file.
 
@@ -190,7 +190,7 @@ Works out of the box with no config file. Default pipeline uses `claude` for all
 ```toml
 [project]
 name = "my-project"
-context_restart_threshold = 10  # auto-restart agent at this % context remaining (0 = disable)
+context_restart_threshold = 0  # auto-restart agent at this % context remaining (0 = disabled, trust agent's internal compaction)
 
 # Git isolation mode: "worktree" (default), "branch", or "none"
 [git]
@@ -579,7 +579,7 @@ class ProjectConfig(BaseModel):
     plan_dir: str = ".llm-cc/tasks/{id}" # template: {id}, {slug}, {branch}, {title}
     plan_file: str = "plan.md"           # constant filename within plan_dir
     review_file: str | None = None       # optional: where review agent writes summary (in plan_dir)
-    context_restart_threshold: int = 10  # auto-restart at this % remaining (0 disables)
+    context_restart_threshold: int = 0   # auto-restart at this % remaining (0 = disabled, trust agent's internal compaction)
 ```
 
 ### Git config
