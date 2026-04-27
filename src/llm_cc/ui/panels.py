@@ -51,6 +51,12 @@ class TaskInputDialog(ModalScreen[Task | None]):
                 placeholder="Definition of done (e.g., 'login works with valid/invalid creds')",
                 id="task-done",
             )
+            yield Label("Checkout branch (optional):")
+            yield Input(
+                value=(self._editing.checkout_branch or "") if self._editing else "",
+                placeholder="Existing branch to attach worktree to (empty = new branch from base)",
+                id="task-checkout-branch",
+            )
             yield Button("Save", variant="primary", id="save-btn")
 
     def on_mount(self) -> None:
@@ -72,16 +78,24 @@ class TaskInputDialog(ModalScreen[Task | None]):
         desc = self.query_one("#task-desc", TextArea).text.strip() or None
         verify = self.query_one("#task-verify", Input).value.strip() or None
         done = self.query_one("#task-done", Input).value.strip() or None
+        checkout_branch = self.query_one("#task-checkout-branch", Input).value.strip() or None
 
         if self._editing:
             self._editing.title = title
             self._editing.description = desc
             self._editing.verify = verify
             self._editing.done = done
+            self._editing.checkout_branch = checkout_branch
             self._editing.touch()
             self.dismiss(self._editing)
         else:
-            task = Task(title=title, description=desc, verify=verify, done=done)
+            task = Task(
+                title=title,
+                description=desc,
+                verify=verify,
+                done=done,
+                checkout_branch=checkout_branch,
+            )
             self.dismiss(task)
 
     def action_save(self) -> None:

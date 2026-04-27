@@ -292,12 +292,26 @@ class PtyBackend:
         allowed_flag = ""
         if config.allowed_tools and config.command == "claude":
             allowed_flag = "--allowedTools " + shlex.quote(",".join(config.allowed_tools))
+        # Codex --full-auto: skip approval prompts inside isolated workspace.
+        # Skipped if the user has already specified an approval/sandbox flag.
+        full_auto_flag = ""
+        if (
+            config.auto_full_auto
+            and config.command == "codex"
+            and "--full-auto" not in cli_flags
+            and "--ask-for-approval" not in cli_flags
+            and " -a " not in f" {cli_flags} "
+            and "--sandbox" not in cli_flags
+            and " -s " not in f" {cli_flags} "
+            and "--dangerously-bypass-approvals-and-sandbox" not in cli_flags
+        ):
+            full_auto_flag = "--full-auto"
         cmd_args = config.args_template.format(
             prompt=shlex.quote(prompt),
             session_id=task.id,
             model=config.model or "",
         )
-        parts = [config.command, model_flag, allowed_flag, cli_flags, cmd_args]
+        parts = [config.command, model_flag, allowed_flag, full_auto_flag, cli_flags, cmd_args]
         full_cmd = " ".join(p for p in parts if p).strip()
 
         # Log path

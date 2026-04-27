@@ -33,6 +33,7 @@ def _import_tasks(storage: object, tasks_path: Path) -> int:
             description=entry.get("description"),
             verify=entry.get("verify"),
             done=entry.get("done"),
+            checkout_branch=entry.get("checkout_branch"),
         )
         # Atomic per-task upsert (read-modify-write under one lock)
         storage.save_task(task)
@@ -88,6 +89,12 @@ def main() -> None:
     storage.ensure_dirs()
     storage.ensure_gitignore()
     storage.update_recent_projects(str(project_path))
+
+    # Auto-permissions setup (idempotent, silent after first run)
+    from llm_cc.permissions import ensure_global_claude_default_mode, ensure_global_gitignore
+
+    ensure_global_gitignore()
+    ensure_global_claude_default_mode()
 
     # Import tasks if --tasks specified or .llm-cc/tasks.toml exists
     if tasks_file:

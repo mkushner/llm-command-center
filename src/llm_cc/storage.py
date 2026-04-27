@@ -229,6 +229,7 @@ def _default_agents() -> dict[str, AgentConfig]:
             command="codex",
             args_template='"{prompt}"',
             co_author="Codex <noreply@openai.com>",
+            auto_full_auto=True,
         ),
     }
 

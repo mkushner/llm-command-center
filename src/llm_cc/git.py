@@ -7,7 +7,8 @@ import shutil
 from pathlib import Path
 
 from .models import GitConfig, GitMode, Task
-from .utils import async_run
+from .permissions import write_claude_settings
+from .utils import RunResult, async_run
 
 
 class GitWorkspace:
@@ -92,7 +93,15 @@ class GitWorkspace:
     async def _setup_worktree(self, task: Task) -> Path:
         slug = task.slug()
         wt_path = self.project_path / ".llm-cc" / "worktrees" / slug
-        branch = f"{self.config.branch_prefix}{slug}"
+
+        # Explicit checkout_branch bypasses slug-based branch naming and
+        # attaches the worktree to an existing branch rather than cutting a new one.
+        if task.checkout_branch:
+            branch = task.checkout_branch
+            use_existing_branch = True
+        else:
+            branch = f"{self.config.branch_prefix}{slug}"
+            use_existing_branch = False
 
         # If worktree already exists and is valid, reuse it (preserves uncommitted work)
         if wt_path.exists() and (wt_path / ".git").exists():
@@ -110,31 +119,73 @@ class GitWorkspace:
             check=False,
         )
 
-        # Try to create worktree with new branch
-        result = await async_run(
-            ["git", "worktree", "add", str(wt_path), "-b", branch, self.config.base_branch],
-            cwd=self.project_path,
-            check=False,
-            capture=True,
-        )
-        if result.returncode != 0:
-            if "already exists" in result.stderr:
-                # Branch exists but no worktree — reuse the branch
-                result2 = await async_run(
+        if use_existing_branch:
+            result = await self._worktree_add_existing(wt_path, branch)
+        else:
+            result = await async_run(
+                ["git", "worktree", "add", str(wt_path), "-b", branch, self.config.base_branch],
+                cwd=self.project_path,
+                check=False,
+                capture=True,
+            )
+            if result.returncode != 0 and "already exists" in result.stderr:
+                # Slug-branch exists but no worktree — attach to existing branch
+                result = await async_run(
                     ["git", "worktree", "add", str(wt_path), branch],
                     cwd=self.project_path,
                     check=False,
                     capture=True,
                 )
-                if result2.returncode != 0:
-                    raise RuntimeError(f"git worktree add failed: {result2.stderr.strip()}")
-            else:
-                raise RuntimeError(f"git worktree add failed: {result.stderr.strip()}")
+
+        if result.returncode != 0:
+            stderr = result.stderr.strip()
+            if "already used by worktree" in stderr or "is already checked out" in stderr:
+                raise RuntimeError(
+                    f"branch '{branch}' is already checked out elsewhere "
+                    f"(main checkout or another worktree). Switch that checkout off "
+                    f"the branch or pick a different branch."
+                )
+            raise RuntimeError(f"git worktree add failed: {stderr}")
 
         await self._init_workspace(wt_path)
+        write_claude_settings(wt_path)
         task.worktree_path = str(wt_path)
         task.branch_name = branch
         return wt_path
+
+    async def _worktree_add_existing(self, wt_path: Path, branch: str) -> RunResult:
+        """Attach a worktree to an existing branch (local or remote-tracking)."""
+        local = await async_run(
+            ["git", "rev-parse", "--verify", f"refs/heads/{branch}"],
+            cwd=self.project_path,
+            check=False,
+            capture=True,
+        )
+        if local.returncode == 0:
+            return await async_run(
+                ["git", "worktree", "add", str(wt_path), branch],
+                cwd=self.project_path,
+                check=False,
+                capture=True,
+            )
+        # No local branch — try remote and create a local tracking branch.
+        remote = await async_run(
+            ["git", "rev-parse", "--verify", f"refs/remotes/origin/{branch}"],
+            cwd=self.project_path,
+            check=False,
+            capture=True,
+        )
+        if remote.returncode != 0:
+            raise RuntimeError(
+                f"checkout_branch '{branch}' not found locally or on origin. "
+                f"Fetch it first (git fetch origin {branch}) or create it."
+            )
+        return await async_run(
+            ["git", "worktree", "add", str(wt_path), "-b", branch, f"origin/{branch}"],
+            cwd=self.project_path,
+            check=False,
+            capture=True,
+        )
 
     async def _current_branch(self) -> str:
         """Return the current branch name, or empty string if detached."""

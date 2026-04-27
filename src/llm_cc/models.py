@@ -32,6 +32,8 @@ class Task(BaseModel):
     session_id: str | None = None
     worktree_path: str | None = None
     branch_name: str | None = None
+    # if set, worktree attaches to this existing branch instead of cutting one from base_branch
+    checkout_branch: str | None = None
     pr_number: int | None = None
     pr_url: str | None = None
     docs_path: str | None = None  # .llm-cc/tasks/<id>/ — shared docs between stages
@@ -100,6 +102,7 @@ class AgentConfig(BaseModel):
     co_author: str = ""
     detect_command: str | None = None
     allowed_tools: list[str] = []  # auto-approved tool patterns (e.g. Read, Bash(git:*))
+    auto_full_auto: bool = False   # codex-only: inject --full-auto flag on spawn
 
     @property
     def display_label(self) -> str:
