@@ -1,119 +1,172 @@
-/* LLM Command Center — Dark theme */
+/* LLM Command Center — design tokens */
 
-$bg: #0d1117;
-$surface: #161b22;
-$surface-hl: #1c2333;
-$border: #30363d;
-$border-hl: #58a6ff;
-$text: #c9d1d9;
-$text-dim: #8b949e;
-$accent: #58a6ff;
-$danger: #f85149;
-$success: #3fb950;
-$warning: #d29922;
+/* Surfaces (low → high) */
+$bg: #0a0d12;
+$bg-elevated: #141923;
+$surface: #1d2433;
+$surface-hi: #29334a;
+
+/* Lines */
+$border: #2a313c;
+$border-strong: #3d4757;
+
+/* Text (loud → quiet) */
+$text: #d7dde6;
+$text-dim: #8b95a5;
+$text-faint: #5d6573;
+
+/* Brand & accent */
+$brand: #8b9eff;
+$accent: #8b9eff;
+$accent-soft: #1f2540;
+
+/* Semantic + soft companion */
+$ok: #4ade80;
+$ok-soft: #14291f;
+$warn: #fbbf24;
+$warn-soft: #2c2114;
+$err: #f87171;
+$err-soft: #2e1719;
+$info: #60a5fa;
 
 Screen {
     background: $bg;
 }
 
-/* --- Board Screen --- */
+/* --- Branded header (single line) --- */
 
 #board-header {
     dock: top;
-    height: 3;
-    background: $surface;
-    color: $text;
-    text-align: center;
-    padding: 1;
-    text-style: bold;
+    height: 1;
+    background: $bg;
+    padding: 0 2;
+    border-bottom: hkey $border;
 }
+
+#board-brand {
+    width: auto;
+    color: $text;
+    background: $bg;
+}
+
+#board-stats {
+    width: 1fr;
+    text-align: right;
+    color: $text-dim;
+    background: $bg;
+}
+
+/* --- Kanban --- */
 
 #kanban-board {
     height: 1fr;
+    background: $bg;
 }
 
 KanbanColumn {
     width: 1fr;
     height: 100%;
-    border: solid $border;
     padding: 0 1;
+    background: $bg;
 }
 
 KanbanColumn.-active {
-    border: solid $border-hl;
+    background: $bg-elevated;
 }
 
 .column-header {
-    text-align: center;
-    text-style: bold;
+    height: 1;
     color: $text-dim;
-    padding: 1 0;
-    height: 3;
+    text-style: bold;
+    padding: 0;
 }
 
 KanbanColumn.-active .column-header {
-    color: $accent;
-    text-style: bold underline;
+    color: $brand;
 }
 
-.column-agent {
-    text-align: center;
-    color: $text-dim;
+.column-meta {
     height: 1;
+    color: $text-faint;
+    padding: 0;
+    display: none;
 }
 
-.column-model {
-    text-align: center;
-    color: $text-dim;
-    height: 1;
+KanbanColumn.-active .column-meta {
+    display: block;
 }
 
-.column-count {
+.column-empty {
+    height: auto;
+    color: $text-faint;
+    padding: 1 1;
     text-align: center;
-    color: $text-dim;
-    height: 1;
 }
+
+#first-launch {
+    dock: top;
+    height: auto;
+    background: $bg-elevated;
+    border: round $accent;
+    padding: 1 2;
+    margin: 1 4;
+    text-align: center;
+    color: $text;
+}
+
+/* --- Task cards (rounded shape via bg-matched corners, no outline) --- */
 
 TaskCard {
     height: auto;
     min-height: 3;
     max-height: 8;
     margin: 0 0 1 0;
-    padding: 1;
+    padding: 0 1 0 2;  /* extra left pad reserves space for selection rail */
     background: $surface;
-    border: solid $border;
+    color: $text;
+    border: round $surface;
 }
 
-TaskCard.-selected {
-    border: double $accent;
-    background: $surface-hl;
-}
+/* Status tints — bg + matching border so corners stay seamless. */
 
 TaskCard.-has-agent {
-    border-left: thick $success;
-}
-
-TaskCard.-stale {
-    border-left: thick $danger;
+    background: $ok-soft;
+    border: round $ok-soft;
 }
 
 TaskCard.-stage-complete {
-    border-left: thick darkorange;
+    background: #2a1d10;
+    border: round #2a1d10;
 }
 
 TaskCard.-waiting {
-    border-left: thick $warning;
+    background: $warn-soft;
+    border: round $warn-soft;
 }
 
 TaskCard.-degraded {
-    border-left: thick $warning;
+    background: $warn-soft;
+    border: round $warn-soft;
+}
+
+TaskCard.-stale {
+    background: $err-soft;
+    border: round $err-soft;
+    color: $text-dim;
 }
 
 TaskCard.-ctx-critical {
-    border-left: thick $danger;
+    background: $err-soft;
+    border: round $err-soft;
 }
 
-/* --- Modals --- */
+/* Selection: keep status tint, add a thick accent rail on the left.
+   Reserves padding above so cards don't shift when the rail appears. */
+TaskCard.-selected {
+    border-left: thick $accent;
+}
+
+/* --- Task input dialog --- */
 
 TaskInputDialog {
     align: center middle;
@@ -122,25 +175,123 @@ TaskInputDialog {
 #task-input-container {
     width: 80;
     height: auto;
-    max-height: 40;
-    background: $surface;
-    border: double $accent;
+    max-height: 90%;
+    background: $bg-elevated;
+    border: round $border-strong;
     padding: 1 2;
 }
 
-#task-input-container Label {
+#task-input-title {
+    height: 1;
     color: $text;
-    padding: 1 0 0 0;
+    margin: 0;
+}
+
+#task-input-hint {
+    height: 1;
+    color: $text-dim;
+    margin: 0 0 1 0;
+    border-bottom: hkey $border;
+    padding: 0 0 1 0;
+}
+
+#task-input-form {
+    height: 1fr;
+    background: $bg-elevated;
+}
+
+#task-input-container Label {
+    color: $text-dim;
+    height: 1;
+    margin: 1 0 0 0;
+    padding: 0;
 }
 
 #task-input-container Input {
-    margin: 0 0 1 0;
+    margin: 0;
+    border: round $border;
+    background: $bg;
+}
+
+#task-input-container Input:focus {
+    border: round $accent;
 }
 
 #task-input-container TextArea {
-    height: 12;
-    margin: 0 0 1 0;
+    height: 5;
+    margin: 0;
+    border: round $border;
+    background: $bg;
 }
+
+#task-input-container TextArea.-focus {
+    border: round $accent;
+}
+
+#task-input-container .form-error {
+    height: auto;
+    color: $err;
+    padding: 0 1;
+    margin: 0;
+}
+
+#task-input-container #task-desc {
+    height: 8;
+}
+
+#task-input-buttons {
+    dock: bottom;
+    height: 5;
+    align: right middle;
+    padding: 1 0 0 0;
+    border-top: hkey $border;
+    background: $bg-elevated;
+}
+
+#task-input-buttons Button {
+    min-width: 12;
+    margin: 0 0 0 1;
+}
+
+/* --- Help screen --- */
+
+HelpScreen {
+    align: center middle;
+}
+
+#help-container {
+    width: 70;
+    height: 80%;
+    background: $bg-elevated;
+    border: round $border-strong;
+    padding: 1 2;
+}
+
+#help-title {
+    height: 1;
+    color: $text;
+    margin: 0;
+}
+
+#help-hint {
+    height: 1;
+    color: $text-dim;
+    margin: 0 0 1 0;
+    border-bottom: hkey $border;
+    padding: 0 0 1 0;
+}
+
+#help-container VerticalScroll {
+    height: 1fr;
+    background: $bg-elevated;
+}
+
+#help-body {
+    color: $text;
+    padding: 0 1;
+}
+
+/* --- Confirm dialog (severity-aware) --- */
 
 ConfirmDialog {
     align: center middle;
@@ -149,9 +300,17 @@ ConfirmDialog {
 #confirm-container {
     width: 50;
     height: auto;
-    background: $surface;
-    border: double $danger;
+    background: $bg-elevated;
+    border: round $border-strong;
     padding: 1 2;
+}
+
+#confirm-container.-warning {
+    border: round $warn;
+}
+
+#confirm-container.-danger {
+    border: round $err;
 }
 
 #confirm-buttons {
@@ -164,52 +323,101 @@ ConfirmDialog {
     margin: 0 1;
 }
 
-/* --- Agent Panel --- */
+/* --- Tabs --- */
 
-AgentPanel {
-    align: center middle;
-}
-
-#agent-panel {
-    width: 100%;
-    height: 100%;
-    background: $surface;
-    border: none;
-    padding: 0 1;
-}
-
-#agent-scroll {
+TabbedContent {
     height: 1fr;
-    border: solid $border;
-    padding: 1;
 }
 
-#agent-output {
-    color: $text;
+TabbedContent ContentSwitcher {
+    height: 1fr;
 }
 
-#agent-status {
-    dock: bottom;
+TabPane {
+    padding: 0;
+    height: 1fr;
+}
+
+/* --- Agent panel --- */
+
+AgentPanelView {
+    width: 1fr;
+    height: 1fr;
+    background: $bg;
+    padding: 0;
+}
+
+AgentPanelView .agent-titlebar {
+    dock: top;
     height: 1;
-    color: $text;
-    background: $surface-hl;
+    color: $text-faint;
+    background: $bg;
     padding: 0 1;
-    border-top: solid $border;
+    border-bottom: hkey $border;
 }
 
-#agent-help {
+AgentPanelView:focus-within .agent-titlebar {
+    color: $text-dim;
+    border-bottom: hkey $border-strong;
+}
+
+AgentPanelView .agent-scroll {
+    height: 1fr;
+    padding: 0 1;
+    background: $bg;
+}
+
+AgentPanelView .agent-output {
+    color: $text-dim;
+}
+
+AgentPanelView:focus-within .agent-output {
+    color: $text;
+}
+
+AgentPanelView .agent-status {
     dock: bottom;
     height: 1;
-    color: $text-dim;
-    margin: 0 0 0 0;
+    color: $text;
+    background: $bg-elevated;
+    padding: 0 1;
+    border-top: hkey $border;
 }
 
-#agent-input {
+AgentPanelView .agent-help {
+    dock: bottom;
+    height: 1;
+    color: $text-faint;
+    background: $bg-elevated;
+    padding: 0 1;
+}
+
+AgentPanelView .agent-input {
     dock: bottom;
     margin: 0;
+    border: round $accent;
+    background: $bg-elevated;
 }
 
-/* --- Diff View --- */
+AgentPanelView .agent-pause {
+    dock: bottom;
+    height: 1;
+    color: $warn;
+    background: $warn-soft;
+    padding: 0 1;
+    text-align: center;
+}
+
+AgentPanelView .agent-prompt-banner {
+    dock: top;
+    height: 1;
+    color: $warn;
+    background: $warn-soft;
+    padding: 0 1;
+    text-align: center;
+}
+
+/* --- Diff view --- */
 
 DiffView {
     align: center middle;
@@ -218,18 +426,47 @@ DiffView {
 #diff-view {
     width: 90%;
     height: 80%;
-    background: $surface;
-    border: double $accent;
-    padding: 1;
+    background: $bg-elevated;
+    border: round $accent;
+    padding: 1 1 0 1;
+}
+
+#diff-header {
+    dock: top;
+    height: 1;
+    color: $text-dim;
+    padding: 0 1;
+    border-bottom: hkey $border;
 }
 
 #diff-content {
     color: $text;
 }
 
+/* --- Toasts --- */
+
+Toast {
+    background: $bg-elevated;
+    border: round $border-strong;
+    padding: 0 1;
+}
+
+Toast.-information {
+    border: round $info;
+}
+
+Toast.-warning {
+    border: round $warn;
+}
+
+Toast.-error {
+    border: round $err;
+}
+
 /* --- Footer --- */
 
 Footer {
     dock: bottom;
-    background: $surface;
+    background: $bg-elevated;
+    color: $text-dim;
 }

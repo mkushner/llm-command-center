@@ -8,7 +8,6 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field, model_validator
 
-
 # --- Task ---
 
 
@@ -124,17 +123,16 @@ class PipelineStage(BaseModel):
     mode_override: AgentMode | None = None
     prompt_template: str | None = None
     cli_flags: str = ""  # extra CLI flags for this stage
-    skip_permissions: bool = False  # inject --dangerously-skip-permissions for this stage
     allowed_tools: list[str] = []   # additional auto-approved tools (merged with agent defaults)
     auto: bool = False  # auto-advance to next stage when agent reports completion
 
     @property
     def effective_cli_flags(self) -> str:
-        """CLI flags with skip_permissions injected if enabled."""
-        parts = [self.cli_flags] if self.cli_flags else []
-        if self.skip_permissions and "--dangerously-skip-permissions" not in self.cli_flags:
-            parts.append("--dangerously-skip-permissions")
-        return " ".join(parts)
+        """CLI flags with --dangerously-skip-permissions stripped (always denied)."""
+        if not self.cli_flags:
+            return ""
+        toks = [t for t in self.cli_flags.split() if t != "--dangerously-skip-permissions"]
+        return " ".join(toks)
 
     @model_validator(mode="after")
     def _check_agent_or_agents(self) -> PipelineStage:

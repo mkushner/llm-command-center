@@ -1,7 +1,16 @@
 """Tests for brainstorm model extensions."""
 
 import pytest
-from llm_cc.models import AgentConfig, MergedConfig, PipelineStage, Task, TaskStatus, GlobalConfig, ProjectConfig
+
+from llm_cc.models import (
+    AgentConfig,
+    GlobalConfig,
+    MergedConfig,
+    PipelineStage,
+    ProjectConfig,
+    Task,
+    TaskStatus,
+)
 
 
 def test_pipeline_stage_single_agent():

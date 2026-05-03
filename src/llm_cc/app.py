@@ -3,17 +3,16 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 from textual.app import App
 
-from llm_cc.agents import AgentRegistry
+from llm_cc.agents import AgentRegistry, is_clean_exit_mode
 from llm_cc.git import GitWorkspace
-from llm_cc.models import TaskStatus
 from llm_cc.pipeline import PipelineEngine
 from llm_cc.storage import Storage
 from llm_cc.ui.board import BoardScreen
-
 
 _STATUSLINE_SCRIPT = '''\
 #!/usr/bin/env python3
@@ -73,6 +72,36 @@ class CommandCenterApp(App):
             self._config, self.registry, self.git, self.storage
         )
         self._setup_statusline()
+        # Toast dedupe: drop identical messages emitted within 1.5s
+        self._recent_notifies: dict[str, float] = {}
+
+    def notify(
+        self,
+        message: str,
+        *,
+        title: str = "",
+        severity: str = "information",
+        timeout: float | None = None,
+        markup: bool = True,
+    ) -> None:
+        key = f"{severity}:{message}"
+        now = time.monotonic()
+        last = self._recent_notifies.get(key)
+        if last is not None and now - last < 1.5:
+            return
+        self._recent_notifies[key] = now
+        if len(self._recent_notifies) > 64:
+            cutoff = now - 5.0
+            self._recent_notifies = {
+                k: t for k, t in self._recent_notifies.items() if t >= cutoff
+            }
+        super().notify(
+            message,
+            title=title,
+            severity=severity,  # type: ignore[arg-type]
+            timeout=timeout,
+            markup=markup,
+        )
 
     def _setup_statusline(self) -> None:
         """Write statusline hook script and configure Claude Code globally."""
@@ -102,28 +131,18 @@ class CommandCenterApp(App):
             settings_path.parent.mkdir(parents=True, exist_ok=True)
             settings_path.write_text(json.dumps(settings, indent=2))
 
-    def on_mount(self) -> None:
-        self._cleanup_stale_sessions()
+    async def on_mount(self) -> None:
+        reattached, orphans = await self.registry.reattach_existing(self.project_path)
+        if reattached:
+            self.notify(f"Reattached to {reattached} agent session(s)", timeout=3)
+        if orphans:
+            self.log(f"orphan tmux sessions (no matching task): {orphans}")
         self.push_screen(BoardScreen(self.storage, self.pipeline, self.registry))
-
-    def _cleanup_stale_sessions(self) -> None:
-        """Clear session_id from tasks whose processes are no longer running."""
-        store = self.storage.load_tasks()
-        for task in store.tasks:
-            if task.session_id and task.status in (TaskStatus.PLANNING, TaskStatus.EXECUTE, TaskStatus.REVIEW):
-                alive = False
-                try:
-                    agent_config = self._config.agent_for_stage(task.status, task)
-                    backend = self.registry.backend_for(agent_config.name)
-                    alive = backend.is_alive(task.session_id)
-                except Exception:
-                    pass
-                if not alive:
-                    task.session_id = None
-                    # Atomic per-task save (no full-store overwrite)
-                    self.storage.save_task(task)
 
     async def on_unmount(self) -> None:
         if self.registry.session_store:
             self.registry.session_store.flush_all()
-        await self.registry.cleanup_all()
+        if is_clean_exit_mode():
+            await self.registry.cleanup_all()
+        else:
+            await self.registry.detach_all()

@@ -2,9 +2,21 @@
 
 from __future__ import annotations
 
+import shutil
 import sys
 import tomllib
 from pathlib import Path
+
+
+def _require_tmux() -> None:
+    """Verify tmux is on PATH. llm-cc requires it as the agent backend."""
+    if shutil.which("tmux") is None:
+        print(
+            "Error: tmux is required by llm-cc but was not found on PATH.\n"
+            "Install with: brew install tmux",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 
 def _import_tasks(storage: object, tasks_path: Path) -> int:
@@ -45,6 +57,7 @@ def _import_tasks(storage: object, tasks_path: Path) -> int:
 def main() -> None:
     args = sys.argv[1:]
     tasks_file: str | None = None
+    clean_exit = False
 
     # Extract --tasks flag
     if "--tasks" in args:
@@ -55,6 +68,11 @@ def main() -> None:
         else:
             print("Error: --tasks requires a file path", file=sys.stderr)
             sys.exit(1)
+
+    # --clean-exit: kill tmux sessions on shutdown (default: leave them running)
+    if "--clean-exit" in args:
+        clean_exit = True
+        args = [a for a in args if a != "--clean-exit"]
 
     # Determine project path: first positional arg or cwd
     if args and args[0] not in ("--help", "-h", "--version"):
@@ -69,18 +87,22 @@ def main() -> None:
         return
 
     if "--help" in args or "-h" in args:
-        print("Usage: llm-cc [project-path] [--tasks tasks.toml]")
+        print("Usage: llm-cc [project-path] [--tasks tasks.toml] [--clean-exit]")
         print("  Launch the LLM Command Center TUI for the given project.")
         print("  Defaults to current directory if no path given.")
         print("")
         print("Options:")
         print("  --tasks FILE  Import tasks from a TOML file into BACKLOG")
+        print("  --clean-exit  Kill tmux agent sessions on shutdown")
+        print("                (default: sessions persist for reattach)")
         return
 
     # Ensure project path exists
     if not project_path.is_dir():
         print(f"Error: {project_path} is not a directory", file=sys.stderr)
         sys.exit(1)
+
+    _require_tmux()
 
     # Initialize storage and ensure .llm-cc dir exists
     from llm_cc.storage import Storage
@@ -113,8 +135,10 @@ def main() -> None:
             if count:
                 print(f"Imported {count} task{'s' if count != 1 else ''} from .llm-cc/tasks.toml")
 
+    from llm_cc.agents import set_clean_exit_mode
     from llm_cc.app import CommandCenterApp
 
+    set_clean_exit_mode(clean_exit)
     app = CommandCenterApp(project_path=project_path)
     app.run()
 
