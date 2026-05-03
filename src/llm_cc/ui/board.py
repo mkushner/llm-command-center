@@ -1,4 +1,4 @@
-"""Kanban board screen: columns, task cards, vim-like navigation."""
+"""Kanban board screen: columns, task cards, arrow-key navigation."""
 
 from __future__ import annotations
 
@@ -244,14 +244,10 @@ class BoardScreen(Screen):
 
     BINDINGS = [
         # Kanban navigation (overview tab only)
-        Binding("[", "move_left", "Left", show=True),
-        Binding("left", "move_left", "Left", show=False),
-        Binding("]", "move_right", "Right", show=True),
-        Binding("right", "move_right", "Right", show=False),
-        Binding("j", "move_down", "Down", show=True),
-        Binding("down", "move_down", "Down", show=False),
-        Binding("k", "move_up", "Up", show=True),
-        Binding("up", "move_up", "Up", show=False),
+        Binding("left", "move_left", "Left", show=True, priority=True),
+        Binding("right", "move_right", "Right", show=True, priority=True),
+        Binding("down", "move_down", "Down", show=True, priority=True),
+        Binding("up", "move_up", "Up", show=True, priority=True),
         Binding("o", "new_task", "New Task", show=True),
         Binding("e", "edit_task", "Edit", show=True),
         Binding("enter", "open_agent", "Agent", show=True),

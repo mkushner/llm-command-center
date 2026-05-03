@@ -149,9 +149,8 @@ class HelpScreen(ModalScreen[None]):
 
     SECTIONS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
         ("Navigation", (
-            ("[  ]", "move column left / right"),
-            ("j  k", "move down / up within column"),
-            ("← → ↑ ↓", "arrow alternatives"),
+            ("← →", "move column left / right"),
+            ("↑ ↓", "move up / down within column"),
         )),
         ("Tasks", (
             ("o", "new task"),
@@ -181,9 +180,9 @@ class HelpScreen(ModalScreen[None]):
             ("esc", "back to overview"),
         )),
         ("Diff View", (
-            ("j  k", "scroll line"),
-            ("ctrl+d  ctrl+u", "page down / up"),
-            ("g  G", "top / bottom"),
+            ("↑ ↓", "scroll line"),
+            ("pgup / pgdn", "page up / down"),
+            ("home / end", "top / bottom"),
             ("q  esc", "close"),
         )),
         ("Misc", (
@@ -653,17 +652,17 @@ def agent_pane_id(session_id: str) -> str:
 
 
 class DiffView(ModalScreen[None]):
-    """Scrollable git diff viewer with summary header and vim scroll keys."""
+    """Scrollable git diff viewer with summary header and arrow scroll keys."""
 
     BINDINGS = [
         Binding("escape", "close", "Close"),
         Binding("q", "close", "Close"),
-        Binding("j", "scroll_down", "Down", show=True),
-        Binding("k", "scroll_up", "Up", show=True),
-        Binding("ctrl+d", "page_down", "Page Down", show=True),
-        Binding("ctrl+u", "page_up", "Page Up", show=True),
-        Binding("g", "scroll_home", "Top"),
-        Binding("G", "scroll_end", "Bottom"),
+        Binding("down", "scroll_down", "Down", show=True),
+        Binding("up", "scroll_up", "Up", show=True),
+        Binding("pagedown", "page_down", "Page Down", show=True),
+        Binding("pageup", "page_up", "Page Up", show=True),
+        Binding("home", "scroll_home", "Top"),
+        Binding("end", "scroll_end", "Bottom"),
     ]
 
     def __init__(self, diff_text: str, title: str = "Diff") -> None:
