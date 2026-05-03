@@ -2,13 +2,11 @@
 
 import json
 import os
-from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
 from llm_cc.health import AgentHealth, ContextMonitor, HealthScorer
-
 
 # --- ContextMonitor.update_from_status ---
 
@@ -154,150 +152,121 @@ def test_agent_health_token_fields_set():
     assert h.cache_read_tokens == 3000
 
 
-# --- PtyBackend env var injection ---
+# --- TmuxBackend env var injection ---
 
 
-def test_env_var_injected(tmp_path):
-    """spawn_env includes LLM_CC_TASK_ID after start()."""
-    from llm_cc.agents import PtyBackend
+@pytest.fixture
+def patched_tmux():
+    """Patch tmux invocations so tests don't actually spawn sessions."""
+    async def fake_tmux(*args, **kwargs):
+        return 0, b"", b""
+
+    def fake_tmux_sync(*args, **kwargs):
+        return 0, b""
+
+    with patch("llm_cc.agents._tmux", side_effect=fake_tmux) as a_mock, \
+         patch("llm_cc.agents._tmux_sync", side_effect=fake_tmux_sync):
+        yield a_mock
+
+
+async def test_env_var_injected(tmp_path, patched_tmux):
+    """tmux new-session args include LLM_CC_TASK_ID."""
+    from llm_cc.agents import TmuxBackend
     from llm_cc.models import AgentConfig, Task
 
-    backend = PtyBackend()
+    backend = TmuxBackend()
     task = Task(title="Test task")
     config = AgentConfig(name="test", command="echo", args_template="{prompt}")
 
-    with patch("pexpect.spawn") as mock_spawn:
-        mock_child = MagicMock()
-        mock_child.isalive.return_value = True
-        mock_spawn.return_value = mock_child
+    session_id = await backend.start(config, task, "test prompt", tmp_path)
 
-        import asyncio
-        session_id = asyncio.get_event_loop().run_until_complete(
-            backend.start(config, task, "test prompt", tmp_path)
-        )
+    new_session_calls = [c for c in patched_tmux.call_args_list if c.args[0] == "new-session"]
+    assert new_session_calls, "expected a new-session invocation"
+    args = new_session_calls[0].args
+    assert f"LLM_CC_TASK_ID={task.id}" in args
 
-        call_kwargs = mock_spawn.call_args
-        env = call_kwargs.kwargs.get("env") or call_kwargs[1].get("env", {})
-        assert env.get("LLM_CC_TASK_ID") == task.id
-
-        mock_child.isalive.return_value = False
-        asyncio.get_event_loop().run_until_complete(backend.stop(session_id))
+    await backend.stop(session_id)
 
 
-# --- Status file tracking ---
-
-
-def test_status_file_tracked(tmp_path):
+async def test_status_file_tracked(tmp_path, patched_tmux):
     """Status file path is stored on start and removed on stop."""
-    from llm_cc.agents import PtyBackend
+    from llm_cc.agents import TmuxBackend
     from llm_cc.models import AgentConfig, Task
 
-    backend = PtyBackend()
+    backend = TmuxBackend()
     task = Task(title="Test task")
     config = AgentConfig(name="test", command="echo", args_template="{prompt}")
 
-    with patch("pexpect.spawn") as mock_spawn:
-        mock_child = MagicMock()
-        mock_child.isalive.return_value = True
-        mock_spawn.return_value = mock_child
+    session_id = await backend.start(config, task, "test", tmp_path)
 
-        import asyncio
-        session_id = asyncio.get_event_loop().run_until_complete(
-            backend.start(config, task, "test", tmp_path)
-        )
+    expected_path = tmp_path / ".llm-cc" / "status" / f"{task.id}.json"
+    assert backend._status_files[session_id] == expected_path
 
-        expected_path = tmp_path / ".llm-cc" / "status" / f"{task.id}.json"
-        assert backend._status_files[session_id] == expected_path
+    expected_path.parent.mkdir(parents=True, exist_ok=True)
+    expected_path.write_text('{"test": true}')
+    assert expected_path.exists()
 
-        expected_path.parent.mkdir(parents=True, exist_ok=True)
-        expected_path.write_text('{"test": true}')
-        assert expected_path.exists()
+    await backend.stop(session_id)
 
-        mock_child.isalive.return_value = False
-        asyncio.get_event_loop().run_until_complete(backend.stop(session_id))
-
-        assert session_id not in backend._status_files
-        assert not expected_path.exists()
+    assert session_id not in backend._status_files
+    assert not expected_path.exists()
 
 
-# --- Status file reading ---
-
-
-def test_read_status_file(tmp_path):
+async def test_read_status_file(tmp_path, patched_tmux):
     """_read_status_file returns parsed JSON from status file."""
-    from llm_cc.agents import PtyBackend
+    from llm_cc.agents import TmuxBackend
     from llm_cc.models import AgentConfig, Task
 
-    backend = PtyBackend()
+    backend = TmuxBackend()
     task = Task(title="Test task")
     config = AgentConfig(name="test", command="echo", args_template="{prompt}")
 
-    with patch("pexpect.spawn") as mock_spawn:
-        mock_child = MagicMock()
-        mock_child.isalive.return_value = True
-        mock_spawn.return_value = mock_child
+    session_id = await backend.start(config, task, "test", tmp_path)
 
-        import asyncio
-        session_id = asyncio.get_event_loop().run_until_complete(
-            backend.start(config, task, "test", tmp_path)
-        )
+    assert backend._read_status_file(session_id) is None
 
-        assert backend._read_status_file(session_id) is None
-
-        status_file = backend._status_files[session_id]
-        status_file.parent.mkdir(parents=True, exist_ok=True)
-        status_data = {
-            "context_window": {
-                "used_percentage": 45,
-                "total_output_tokens": 1000,
-                "current_usage": {
-                    "input_tokens": 5000,
-                    "cache_creation_input_tokens": 500,
-                    "cache_read_input_tokens": 2000,
-                },
+    status_file = backend._status_files[session_id]
+    status_file.parent.mkdir(parents=True, exist_ok=True)
+    status_data = {
+        "context_window": {
+            "used_percentage": 45,
+            "total_output_tokens": 1000,
+            "current_usage": {
+                "input_tokens": 5000,
+                "cache_creation_input_tokens": 500,
+                "cache_read_input_tokens": 2000,
             },
-        }
-        status_file.write_text(json.dumps(status_data))
+        },
+    }
+    status_file.write_text(json.dumps(status_data))
 
-        result = backend._read_status_file(session_id)
-        assert result == status_data
+    result = backend._read_status_file(session_id)
+    assert result == status_data
 
-        mock_child.isalive.return_value = False
-        asyncio.get_event_loop().run_until_complete(backend.stop(session_id))
+    await backend.stop(session_id)
 
 
-def test_status_data_public_method(tmp_path):
+async def test_status_data_public_method(tmp_path, patched_tmux):
     """status_data() provides public access to statusline JSON."""
-    from llm_cc.agents import PtyBackend
+    from llm_cc.agents import TmuxBackend
     from llm_cc.models import AgentConfig, Task
 
-    backend = PtyBackend()
+    backend = TmuxBackend()
     task = Task(title="Test task")
     config = AgentConfig(name="test", command="echo", args_template="{prompt}")
 
-    with patch("pexpect.spawn") as mock_spawn:
-        mock_child = MagicMock()
-        mock_child.isalive.return_value = True
-        mock_spawn.return_value = mock_child
+    session_id = await backend.start(config, task, "test", tmp_path)
 
-        import asyncio
-        session_id = asyncio.get_event_loop().run_until_complete(
-            backend.start(config, task, "test", tmp_path)
-        )
+    assert backend.status_data(session_id) is None
 
-        # No file yet
-        assert backend.status_data(session_id) is None
+    status_file = backend._status_files[session_id]
+    status_file.parent.mkdir(parents=True, exist_ok=True)
+    status_file.write_text('{"context_window": {"used_percentage": 30}}')
 
-        # Write status file
-        status_file = backend._status_files[session_id]
-        status_file.parent.mkdir(parents=True, exist_ok=True)
-        status_file.write_text('{"context_window": {"used_percentage": 30}}')
+    result = backend.status_data(session_id)
+    assert result["context_window"]["used_percentage"] == 30
 
-        result = backend.status_data(session_id)
-        assert result["context_window"]["used_percentage"] == 30
-
-        mock_child.isalive.return_value = False
-        asyncio.get_event_loop().run_until_complete(backend.stop(session_id))
+    await backend.stop(session_id)
 
 
 # --- Statusline script setup ---
@@ -305,7 +274,7 @@ def test_status_data_public_method(tmp_path):
 
 def test_statusline_script_setup(tmp_path):
     """Statusline script is written and global settings.local.json configured."""
-    from llm_cc.app import CommandCenterApp, _STATUSLINE_SCRIPT
+    from llm_cc.app import _STATUSLINE_SCRIPT, CommandCenterApp
 
     fake_home = tmp_path / "home"
     fake_home.mkdir()

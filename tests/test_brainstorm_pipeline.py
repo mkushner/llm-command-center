@@ -1,11 +1,17 @@
 """Tests for brainstorm pipeline logic + session resume."""
 
-import pytest
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 from llm_cc.models import (
-    AgentConfig, AgentMode, GlobalConfig, MergedConfig, PipelineStage,
-    ProjectConfig, Task, TaskStatus,
+    AgentConfig,
+    GlobalConfig,
+    MergedConfig,
+    PipelineStage,
+    ProjectConfig,
+    Task,
+    TaskStatus,
 )
 from llm_cc.pipeline import PipelineEngine
 
@@ -288,7 +294,7 @@ def test_cannot_resume_different_flags(tmp_project):
     }
     pipeline = [
         PipelineStage(stage=TaskStatus.PLANNING, agent="claude", cli_flags="--safe"),
-        PipelineStage(stage=TaskStatus.EXECUTE, agent="claude", cli_flags="--dangerously-skip-permissions"),
+        PipelineStage(stage=TaskStatus.EXECUTE, agent="claude", cli_flags="--debug"),
     ]
     config = MergedConfig(
         project=ProjectConfig(),

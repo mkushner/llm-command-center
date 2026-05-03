@@ -1,15 +1,10 @@
 """Tests for agent health monitoring: error detection, context monitoring, health scoring, sessions."""
 
 import json
-import time
-from pathlib import Path
-
-import pytest
 
 from llm_cc.health import (
     AgentHealth,
     ContextMonitor,
-    DetectedError,
     ErrorDetector,
     HealthScorer,
     SessionContext,
@@ -17,7 +12,6 @@ from llm_cc.health import (
     Severity,
 )
 from llm_cc.models import Task
-
 
 # --- Error Detection ---
 

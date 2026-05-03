@@ -8,11 +8,11 @@ from pathlib import Path
 from .agents import AgentRegistry
 from .git import GitWorkspace
 from .models import (
+    STAGE_ORDER,
     GitMode,
     MergedConfig,
     Task,
     TaskStatus,
-    STAGE_ORDER,
 )
 from .storage import Storage
 
@@ -126,8 +126,8 @@ class PipelineEngine:
 
         if "{branch}" in template and not task.branch_name:
             raise RuntimeError(
-                f"plan_dir uses {{branch}} but task has no branch. "
-                f"Set git.mode to 'worktree' or 'branch' in config."
+                "plan_dir uses {branch} but task has no branch. "
+                "Set git.mode to 'worktree' or 'branch' in config."
             )
 
         try:
@@ -758,7 +758,7 @@ class PipelineEngine:
 
         lines = [
             f"BRAINSTORM SUMMARY: {task.title}",
-            f"You are the summarizer. All brainstorm cycles are complete.",
+            "You are the summarizer. All brainstorm cycles are complete.",
             f"Participants were: {', '.join(stage.agents)}",
             f"Total cycles: {stage.max_loops}",
             "",

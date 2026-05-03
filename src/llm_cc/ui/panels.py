@@ -1,13 +1,15 @@
-"""Modal dialogs: task input, confirmation, agent panel, diff view."""
+"""Modal dialogs (task input, diff) and embedded agent panel widget."""
 
 from __future__ import annotations
 
 import asyncio
+import time
 
-from textual import on, work
+from textual import on
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.containers import Container, Horizontal, Vertical, VerticalScroll
+from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Label, Static, TextArea
 
@@ -28,36 +30,46 @@ class TaskInputDialog(ModalScreen[Task | None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="task-input-container"):
-            yield Label("Title:")
-            yield Input(
-                value=self._editing.title if self._editing else "",
-                placeholder="Task title...",
-                id="task-title",
+            yield Static(
+                "[b]Edit task[/]" if self._editing else "[b]New task[/]",
+                id="task-input-title",
             )
-            yield Label("Description (optional):")
-            yield TextArea(
-                (self._editing.description or "") if self._editing else "",
-                id="task-desc",
+            yield Static(
+                "[b]Ctrl+S[/] save  ·  [b]Esc[/] cancel  ·  [b]Tab[/] next field",
+                id="task-input-hint",
             )
-            yield Label("Verify (optional):")
-            yield Input(
-                value=(self._editing.verify or "") if self._editing else "",
-                placeholder="How to verify completion (e.g., 'curl returns 200')",
-                id="task-verify",
-            )
-            yield Label("Done when (optional):")
-            yield Input(
-                value=(self._editing.done or "") if self._editing else "",
-                placeholder="Definition of done (e.g., 'login works with valid/invalid creds')",
-                id="task-done",
-            )
-            yield Label("Checkout branch (optional):")
-            yield Input(
-                value=(self._editing.checkout_branch or "") if self._editing else "",
-                placeholder="Existing branch to attach worktree to (empty = new branch from base)",
-                id="task-checkout-branch",
-            )
-            yield Button("Save", variant="primary", id="save-btn")
+
+            with VerticalScroll(id="task-input-form"):
+                yield Label("Title")
+                yield Input(
+                    value=self._editing.title if self._editing else "",
+                    placeholder="Short imperative summary (e.g. 'add OAuth login')",
+                    id="task-title",
+                )
+                yield Static("", id="task-title-error", classes="form-error")
+
+                yield Label("Spec  [dim](markdown supported)[/]")
+                yield TextArea(
+                    (self._editing.description or "") if self._editing else "",
+                    id="task-desc",
+                    language="markdown",
+                )
+
+                yield Label("How to verify  [dim](optional)[/]")
+                yield TextArea(
+                    (self._editing.verify or "") if self._editing else "",
+                    id="task-verify",
+                )
+
+                yield Label("Done when  [dim](optional)[/]")
+                yield TextArea(
+                    (self._editing.done or "") if self._editing else "",
+                    id="task-done",
+                )
+
+            with Horizontal(id="task-input-buttons"):
+                yield Button("Cancel", id="cancel-btn")
+                yield Button("Save", variant="primary", id="save-btn")
 
     def on_mount(self) -> None:
         self.query_one("#task-title", Input).focus()
@@ -66,26 +78,48 @@ class TaskInputDialog(ModalScreen[Task | None]):
     def handle_save(self) -> None:
         self._do_save()
 
+    @on(Button.Pressed, "#cancel-btn")
+    def handle_cancel(self) -> None:
+        self.dismiss(None)
+
     @on(Input.Submitted, "#task-title")
     def handle_submit(self) -> None:
         self._do_save()
 
+    @on(Input.Changed, "#task-title")
+    def handle_title_changed(self, event: Input.Changed) -> None:
+        """Split pasted multi-line content: first line → title, rest → spec."""
+        value = event.value
+        if "\n" not in value:
+            return
+        first, _, rest = value.partition("\n")
+        title_input = self.query_one("#task-title", Input)
+        title_input.value = first.strip()
+        if rest.strip():
+            desc_area = self.query_one("#task-desc", TextArea)
+            existing = desc_area.text
+            combined = rest.strip() if not existing else f"{existing}\n{rest.strip()}"
+            desc_area.text = combined
+        # Clear any existing error
+        self.query_one("#task-title-error", Static).update("")
+
     def _do_save(self) -> None:
         title = self.query_one("#task-title", Input).value.strip()
+        err_label = self.query_one("#task-title-error", Static)
         if not title:
-            self.notify("Title is required", severity="error")
+            err_label.update("[#f87171]Title is required[/]")
+            self.query_one("#task-title", Input).focus()
             return
+        err_label.update("")
         desc = self.query_one("#task-desc", TextArea).text.strip() or None
-        verify = self.query_one("#task-verify", Input).value.strip() or None
-        done = self.query_one("#task-done", Input).value.strip() or None
-        checkout_branch = self.query_one("#task-checkout-branch", Input).value.strip() or None
+        verify = self.query_one("#task-verify", TextArea).text.strip() or None
+        done = self.query_one("#task-done", TextArea).text.strip() or None
 
         if self._editing:
             self._editing.title = title
             self._editing.description = desc
             self._editing.verify = verify
             self._editing.done = done
-            self._editing.checkout_branch = checkout_branch
             self._editing.touch()
             self.dismiss(self._editing)
         else:
@@ -94,7 +128,6 @@ class TaskInputDialog(ModalScreen[Task | None]):
                 description=desc,
                 verify=verify,
                 done=done,
-                checkout_branch=checkout_branch,
             )
             self.dismiss(task)
 
@@ -105,8 +138,84 @@ class TaskInputDialog(ModalScreen[Task | None]):
         self.dismiss(None)
 
 
+class HelpScreen(ModalScreen[None]):
+    """Keyboard reference modal grouped by topic."""
+
+    BINDINGS = [
+        Binding("escape", "close", "Close"),
+        Binding("question_mark", "close", "Close"),
+        Binding("q", "close", "Close"),
+    ]
+
+    SECTIONS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
+        ("Navigation", (
+            ("[  ]", "move column left / right"),
+            ("j  k", "move down / up within column"),
+            ("← → ↑ ↓", "arrow alternatives"),
+        )),
+        ("Tasks", (
+            ("o", "new task"),
+            ("e", "edit selected task"),
+            ("x", "delete selected task"),
+        )),
+        ("Pipeline", (
+            ("m", "advance to next stage"),
+            ("b", "back to previous stage"),
+            ("r", "restart agent for current stage"),
+            ("s", "stop agent"),
+            ("d", "show diff against base"),
+        )),
+        ("Tabs & Agent", (
+            ("enter", "open agent tab for selected task"),
+            ("ctrl+o", "back to overview"),
+            ("ctrl+→", "next agent tab"),
+            ("ctrl+←", "previous agent tab"),
+        )),
+        ("Inside an Agent Tab", (
+            ("ctrl+c", "interrupt agent"),
+            ("ctrl+t", "open text-input mode"),
+            ("ctrl+v", "paste clipboard"),
+            ("ctrl+y", "copy recent output"),
+            ("shift+pgup/pgdn", "scroll history"),
+            ("shift+end", "resume follow-tail"),
+            ("esc", "back to overview"),
+        )),
+        ("Diff View", (
+            ("j  k", "scroll line"),
+            ("ctrl+d  ctrl+u", "page down / up"),
+            ("g  G", "top / bottom"),
+            ("q  esc", "close"),
+        )),
+        ("Misc", (
+            ("?", "show this help"),
+            ("q", "quit (confirms if agents running)"),
+        )),
+    )
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="help-container"):
+            yield Static("[b]Keyboard Shortcuts[/]", id="help-title")
+            yield Static(
+                "[b]Esc[/] or [b]?[/] to close",
+                id="help-hint",
+            )
+            yield VerticalScroll(Static(self._build_text(), id="help-body"))
+
+    def _build_text(self) -> str:
+        out: list[str] = []
+        for title, rows in self.SECTIONS:
+            out.append(f"\n[b #8b9eff]{title}[/]")
+            for key, desc in rows:
+                out.append(f"  [b #8b9eff]{key:<18}[/]  [dim]{desc}[/]")
+        return "\n".join(out)
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
 class ConfirmDialog(ModalScreen[bool]):
-    """Simple yes/no confirmation."""
+    """Yes/no confirmation. Pass severity='warning' for reversible actions,
+    'danger' for destructive ones."""
 
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
@@ -114,15 +223,17 @@ class ConfirmDialog(ModalScreen[bool]):
         Binding("n", "cancel", "No"),
     ]
 
-    def __init__(self, prompt: str) -> None:
+    def __init__(self, prompt: str, severity: str = "danger") -> None:
         super().__init__()
         self._prompt = prompt
+        self._severity = severity if severity in ("warning", "danger") else "danger"
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="confirm-container"):
+        with Vertical(id="confirm-container", classes=f"-{self._severity}"):
             yield Static(self._prompt)
             with Horizontal(id="confirm-buttons"):
-                yield Button("Yes", variant="error", id="confirm-yes")
+                btn_variant = "error" if self._severity == "danger" else "warning"
+                yield Button("Yes", variant=btn_variant, id="confirm-yes")
                 yield Button("No", variant="default", id="confirm-no")
 
     def on_mount(self) -> None:
@@ -143,53 +254,124 @@ class ConfirmDialog(ModalScreen[bool]):
         self.dismiss(False)
 
 
-class AgentPanel(ModalScreen[None]):
-    """Live agent output viewer with raw key forwarding to PTY.
+class AgentPanelView(Container):
+    """Embedded live agent output viewer with raw key forwarding to PTY.
 
-    All keys forwarded to agent (including Tab, arrows).
-    Esc: close panel
-    Ctrl+C: send interrupt to agent
-    Ctrl+T: toggle text input mode (for typing longer messages)
-    Shift+PageUp/PageDown: scroll output history
-    Shift+End: resume auto-scroll
+    Mounted inside a TabPane (no longer a ModalScreen). All keys are
+    forwarded to the agent's tmux session unless they are reserved for
+    UI navigation:
+
+    - Esc                       → request close (parent switches to Overview)
+    - Ctrl+C                    → send interrupt to agent
+    - Ctrl+V                    → paste clipboard
+    - Ctrl+Y                    → copy recent output to clipboard
+    - Ctrl+T                    → toggle text input mode
+    - Shift+PgUp/PgDn/Home/End  → scroll output history
     """
 
-    def __init__(self, session_id: str, backend: object) -> None:
-        super().__init__()
+    DEFAULT_CSS = ""
+    can_focus = True
+
+    class CloseRequested(Message):
+        """Emitted when the user wants to leave this agent tab."""
+
+        def __init__(self, session_id: str) -> None:
+            super().__init__()
+            self.session_id = session_id
+
+    def __init__(
+        self,
+        session_id: str,
+        backend: object,
+        *,
+        title: str = "",
+        agent: str = "",
+        model: str = "",
+        branch: str = "",
+    ) -> None:
+        super().__init__(id=_view_id(session_id))
         self._session_id = session_id
         self._backend = backend
+        self._title = title
+        self._agent = agent
+        self._model = model
+        self._branch = branch
         self._polling = True
         self._input_mode = False
+        self._follow_tail = True
+        self._glyph_cache: str = ""
+        self._glyph_at: float = 0.0
+
+    def _titlebar_text(self) -> str:
+        parts: list[str] = []
+        if self._agent:
+            parts.append(f"[bold]{self._agent}[/]")
+        if self._model:
+            parts.append(f"[dim]{self._model}[/]")
+        if self._branch:
+            parts.append(f"[#8b9eff]{self._branch}[/]")
+        if self._title:
+            parts.append(f"[dim]{self._title}[/]")
+        return "  ·  ".join(parts) if parts else f"[dim]{self._session_id}[/]"
+
+    @staticmethod
+    def _default_help() -> str:
+        return (
+            "[b]Esc[/] back  ·  [b]Ctrl+C[/] interrupt  ·  "
+            "[b]Ctrl+T[/] type  ·  [b]Ctrl+V[/] paste  ·  "
+            "[b]Ctrl+Y[/] copy  ·  [b]Shift+PgUp/Dn[/] scroll"
+        )
+
+    @staticmethod
+    def _input_help() -> str:
+        return "[b]Enter[/] send  ·  [b]Esc[/] exit text-input mode"
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="agent-panel"):
-            yield Static(f"Agent Session: {self._session_id}", classes="column-header")
-            yield VerticalScroll(Static("Loading...", id="agent-output"), id="agent-scroll")
-            yield Static("[dim]waiting for agent status...[/]", id="agent-status")
-            yield Static(
-                "[dim]All keys go to agent  |  [bold]Ctrl+C[/] interrupt  |  [bold]Ctrl+V[/] paste  |  [bold]Ctrl+T[/] text input  |  [bold]Shift+PgUp/PgDn[/] scroll  |  [bold]Esc[/] close[/]",
-                id="agent-help",
-            )
-            yield Input(placeholder="Type message, press Enter to send (Esc to exit)...", id="agent-input")
+        yield Static(self._titlebar_text(), classes="agent-titlebar")
+        yield Static(
+            "[b]⏸ Waiting for input[/] · [dim]Ctrl+T to type, then Enter[/]",
+            classes="agent-prompt-banner",
+        )
+        yield VerticalScroll(
+            Static("Loading...", classes="agent-output"),
+            classes="agent-scroll",
+        )
+        # Bottom strip — Textual stacks dock:bottom siblings with the
+        # first-composed widget closest to the bottom edge. Compose in
+        # reverse so the visual order (top→bottom) is: pause, input, status, help.
+        yield Static(self._default_help(), classes="agent-help")
+        yield Static("[dim]waiting for agent…[/]", classes="agent-status")
+        yield Input(
+            placeholder="Type, Enter to send · Esc to exit input mode",
+            classes="agent-input",
+        )
+        yield Static(
+            "[b]PAUSED[/] · [dim]Shift+End to resume tail[/]",
+            classes="agent-pause",
+        )
 
     def on_mount(self) -> None:
-        self.query_one("#agent-input", Input).display = False
-        # Resize PTY after layout completes (on_mount fires before sizing)
+        inp = self.query_one(".agent-input", Input)
+        inp.display = False
+        self.query_one(".agent-pause", Static).display = False
+        self.query_one(".agent-prompt-banner", Static).display = False
         self.call_after_refresh(self._resize_pty)
-        self._poll_output()
+        self.run_worker(
+            self._poll_loop(),
+            group=f"agent-poll-{self._session_id}",
+            exclusive=True,
+        )
 
     def on_unmount(self) -> None:
         self._polling = False
 
     def on_resize(self, event) -> None:
-        """Re-fit PTY when terminal/panel is resized."""
         self._resize_pty()
 
     def _resize_pty(self) -> None:
-        """Resize the PTY buffer to match the agent output area."""
         try:
-            scroll = self.query_one("#agent-scroll", VerticalScroll)
-            cols = scroll.size.width - 2  # account for padding
+            scroll = self.query_one(".agent-scroll", VerticalScroll)
+            cols = scroll.size.width - 2
             rows = scroll.size.height
             if cols > 0 and rows > 0 and hasattr(self._backend, "resize_session"):
                 self._backend.resize_session(self._session_id, cols, rows)
@@ -197,58 +379,43 @@ class AgentPanel(ModalScreen[None]):
             pass
 
     async def on_key(self, event) -> None:
-        """Forward raw keystrokes to the PTY agent."""
-        # Input mode: Textual handles the Input widget, Esc exits
         if self._input_mode:
             if event.key == "escape":
                 self._input_mode = False
-                self.query_one("#agent-input", Input).display = False
+                self.query_one(".agent-input", Input).display = False
+                self.query_one(".agent-help", Static).update(self._default_help())
                 event.prevent_default()
                 event.stop()
-            # Let all other keys reach the Input widget naturally
             return
 
-        # Close panel
         if event.key == "escape":
-            self._polling = False
-            self.dismiss(None)
+            event.prevent_default()
+            event.stop()
+            self.post_message(self.CloseRequested(self._session_id))
+            return
+
+        scroll_keys = {
+            "shift+pageup": "scroll_page_up",
+            "shift+pagedown": "scroll_page_down",
+            "shift+home": "scroll_home",
+            "shift+end": "scroll_end",
+        }
+        if event.key in scroll_keys:
+            scroll = self.query_one(".agent-scroll", VerticalScroll)
+            getattr(scroll, scroll_keys[event.key])(animate=False)
+            # Tail-follow: only resume on shift+end
+            self._follow_tail = event.key == "shift+end"
+            self._update_pause_chip()
             event.prevent_default()
             event.stop()
             return
 
-        # Scroll controls (Shift+PageUp/PageDown/Home/End)
-        if event.key == "shift+pageup":
-            self.query_one("#agent-scroll", VerticalScroll).scroll_page_up(animate=False)
-            event.prevent_default()
-            event.stop()
-            return
-
-        if event.key == "shift+pagedown":
-            self.query_one("#agent-scroll", VerticalScroll).scroll_page_down(animate=False)
-            event.prevent_default()
-            event.stop()
-            return
-
-        if event.key == "shift+home":
-            self.query_one("#agent-scroll", VerticalScroll).scroll_home(animate=False)
-            event.prevent_default()
-            event.stop()
-            return
-
-        if event.key == "shift+end":
-            self.query_one("#agent-scroll", VerticalScroll).scroll_end(animate=False)
-            event.prevent_default()
-            event.stop()
-            return
-
-        # Send interrupt to agent
         if event.key == "ctrl+c":
             await self._send_raw("\x03")
             event.prevent_default()
             event.stop()
             return
 
-        # Paste from clipboard
         if event.key == "ctrl+v":
             try:
                 import subprocess
@@ -263,17 +430,38 @@ class AgentPanel(ModalScreen[None]):
             event.stop()
             return
 
-        # Toggle text input mode
-        if event.key == "ctrl+t":
-            self._input_mode = True
-            inp = self.query_one("#agent-input", Input)
-            inp.display = True
-            inp.focus()
+        if event.key == "ctrl+y":
+            try:
+                import subprocess
+                text = ""
+                if hasattr(self._backend, "get_output"):
+                    text = await self._backend.get_output(self._session_id) or ""
+                if text:
+                    proc = subprocess.run(
+                        ["pbcopy"], input=text, text=True, timeout=2
+                    )
+                    if proc.returncode == 0:
+                        self.app.notify("Copied agent output to clipboard")
+                    else:
+                        self.app.notify("Copy failed", severity="warning")
+                else:
+                    self.app.notify("No output to copy", severity="warning")
+            except Exception as e:
+                self.app.notify(f"Copy error: {e}", severity="error")
             event.prevent_default()
             event.stop()
             return
 
-        # Forward everything else to PTY
+        if event.key == "ctrl+t":
+            self._input_mode = True
+            inp = self.query_one(".agent-input", Input)
+            inp.display = True
+            inp.focus()
+            self.query_one(".agent-help", Static).update(self._input_help())
+            event.prevent_default()
+            event.stop()
+            return
+
         key_map = {
             "enter": "\r",
             "up": "\x1b[A",
@@ -283,7 +471,6 @@ class AgentPanel(ModalScreen[None]):
             "tab": "\t",
             "backspace": "\x7f",
         }
-
         seq = key_map.get(event.key)
         if seq:
             await self._send_raw(seq)
@@ -295,12 +482,55 @@ class AgentPanel(ModalScreen[None]):
             event.stop()
 
     async def _send_raw(self, data: str) -> None:
-        """Send raw bytes to the PTY through the backend's public API."""
         if hasattr(self._backend, "send_raw"):
             await self._backend.send_raw(self._session_id, data)
 
+    def _update_pause_chip(self) -> None:
+        try:
+            self.query_one(".agent-pause", Static).display = not self._follow_tail
+        except Exception:
+            pass
+
+    def _heartbeat_glyph(self) -> str:
+        """Health-driven glyph: ● healthy, ◐ degraded, ▪ idle, ✕ dead.
+
+        Cached for ~1s — `is_alive` calls fork tmux, so calling every
+        poll tick (5Hz) would mean 5+ subprocesses/sec per open agent tab.
+        """
+        now = time.monotonic()
+        if now - self._glyph_at < 1.0:
+            return self._glyph_cache
+        backend = self._backend
+        if not hasattr(backend, "is_alive"):
+            self._glyph_cache = ""
+            self._glyph_at = now
+            return self._glyph_cache
+        try:
+            alive = backend.is_alive(self._session_id)
+        except Exception:
+            alive = False
+        if not alive:
+            glyph = "[#f87171]✕[/]"
+        else:
+            score: int | None = None
+            if hasattr(backend, "health"):
+                try:
+                    h = backend.health(self._session_id)
+                    if h is not None:
+                        score = h.score
+                except Exception:
+                    pass
+            if score is None or score >= 75:
+                glyph = "[#4ade80]●[/]"
+            elif score >= 50:
+                glyph = "[#fbbf24]◐[/]"
+            else:
+                glyph = "[#fb923c]▪[/]"
+        self._glyph_cache = glyph
+        self._glyph_at = now
+        return glyph
+
     def _format_status_bar(self, status_data: dict) -> str:
-        """Format status data into a compact status bar string."""
         parts: list[str] = []
         ctx = status_data.get("context_window", {})
         usage = ctx.get("current_usage") or {}
@@ -316,38 +546,34 @@ class AgentPanel(ModalScreen[None]):
                 color = "red"
             parts.append(f"[{color}]{remaining}% ctx[/{color}]")
 
-        input_tok = usage.get("input_tokens")
-        if input_tok is not None:
-            parts.append(f"{input_tok / 1000:.1f}k in")
-
-        output_tok = usage.get("output_tokens")
-        if output_tok is not None:
-            parts.append(f"{output_tok / 1000:.1f}k out")
-
-        cache_create = usage.get("cache_creation_input_tokens")
-        if cache_create is not None:
-            parts.append(f"{cache_create / 1000:.1f}k cache wr")
-
-        cache_read = usage.get("cache_read_input_tokens")
-        if cache_read is not None:
-            parts.append(f"{cache_read / 1000:.1f}k cache rd")
-
+        for key, label in (
+            ("input_tokens", "in"),
+            ("output_tokens", "out"),
+            ("cache_creation_input_tokens", "cache wr"),
+            ("cache_read_input_tokens", "cache rd"),
+        ):
+            v = usage.get(key)
+            if v is not None:
+                parts.append(f"{v / 1000:.1f}k {label}")
         return " | ".join(parts)
 
-    @work(exclusive=True)
-    async def _poll_output(self) -> None:
-        """Continuously refresh agent output with Rich colors and scrollback."""
+    async def _poll_loop(self) -> None:
         from rich.text import Text
 
-        output_widget = self.query_one("#agent-output", Static)
-        scroll = self.query_one("#agent-scroll", VerticalScroll)
-        status_widget = self.query_one("#agent-status", Static)
+        output_widget = self.query_one(".agent-output", Static)
+        scroll = self.query_one(".agent-scroll", VerticalScroll)
+        status_widget = self.query_one(".agent-status", Static)
         while self._polling:
             try:
-                # Check if user is at/near bottom BEFORE updating content
-                at_bottom = scroll.max_scroll_y <= 0 or scroll.scroll_offset.y >= scroll.max_scroll_y - 2
+                at_bottom = (
+                    scroll.max_scroll_y <= 0
+                    or scroll.scroll_offset.y >= scroll.max_scroll_y - 2
+                )
+                # If user scrolled up since last tick, drop tail-follow
+                if self._follow_tail and not at_bottom:
+                    self._follow_tail = False
+                    self._update_pause_chip()
 
-                # Try rich output first (PtyBackend), fall back to plain text
                 rich_content: Text | None = None
                 history: list[Text] = []
                 if hasattr(self._backend, "get_output_rich"):
@@ -355,7 +581,6 @@ class AgentPanel(ModalScreen[None]):
                     history = await self._backend.get_history_rich(self._session_id)
 
                 if rich_content is not None:
-                    # Combine history + current screen
                     if history:
                         combined = Text()
                         for i, line in enumerate(history):
@@ -368,41 +593,77 @@ class AgentPanel(ModalScreen[None]):
                     else:
                         output_widget.update(rich_content)
                 else:
-                    # Fallback for API backend
                     text = await self._backend.get_output(self._session_id)
                     if text:
                         output_widget.update(text)
 
-                # Update status bar from backend's statusline data
                 status_data = None
                 if hasattr(self._backend, "status_data"):
                     status_data = self._backend.status_data(self._session_id)
+                glyph = self._heartbeat_glyph()
                 if status_data:
-                    status_widget.update(self._format_status_bar(status_data))
+                    bar = self._format_status_bar(status_data)
+                    status_widget.update(
+                        f"{glyph}  {bar}" if glyph else bar
+                    )
+                elif glyph:
+                    status_widget.update(f"{glyph}  [dim]waiting for telemetry…[/]")
 
-                # Only auto-scroll if user was at bottom before content update
-                if at_bottom:
+                # Waiting-for-input banner
+                waiting = False
+                if hasattr(self._backend, "is_waiting_for_input"):
+                    try:
+                        waiting = bool(
+                            self._backend.is_waiting_for_input(self._session_id)
+                        )
+                    except Exception:
+                        waiting = False
+                try:
+                    self.query_one(".agent-prompt-banner", Static).display = waiting
+                except Exception:
+                    pass
+
+                if self._follow_tail:
                     scroll.scroll_end(animate=False)
             except Exception:
                 break
             await asyncio.sleep(0.2)
 
-    @on(Input.Submitted, "#agent-input")
+    @on(Input.Submitted, ".agent-input")
     async def handle_input(self, event: Input.Submitted) -> None:
         text = event.value.strip()
         if text and hasattr(self._backend, "send_input"):
             await self._backend.send_input(self._session_id, text)
         event.input.value = ""
         self._input_mode = False
-        self.query_one("#agent-input", Input).display = False
+        self.query_one(".agent-input", Input).display = False
+        self.query_one(".agent-help", Static).update(self._default_help())
+
+
+def _view_id(session_id: str) -> str:
+    """Convert a tmux session_id into a Textual-safe widget id."""
+    safe = "".join(c if (c.isalnum() or c == "-") else "_" for c in session_id)
+    return f"agent-view-{safe}"
+
+
+def agent_pane_id(session_id: str) -> str:
+    """Tab pane id derived from session_id; stable across remounts."""
+    safe = "".join(c if (c.isalnum() or c == "-") else "_" for c in session_id)
+    return f"tab-{safe}"
 
 
 class DiffView(ModalScreen[None]):
-    """Scrollable git diff viewer."""
+    """Scrollable git diff viewer with summary header and vim scroll keys."""
 
     BINDINGS = [
         Binding("escape", "close", "Close"),
         Binding("q", "close", "Close"),
+        Binding("j", "scroll_down", "Down", show=True),
+        Binding("k", "scroll_up", "Up", show=True),
+        Binding("ctrl+d", "page_down", "Page Down", show=True),
+        Binding("ctrl+u", "page_up", "Page Up", show=True),
+        Binding("g", "scroll_home", "Top"),
+        Binding("G", "scroll_end", "Bottom"),
     ]
 
     def __init__(self, diff_text: str, title: str = "Diff") -> None:
@@ -410,12 +671,67 @@ class DiffView(ModalScreen[None]):
         self._diff = diff_text
         self._title = title
 
+    def _summary(self) -> str:
+        if not self._diff:
+            return f"[dim]{self._title}  ·  no changes[/]"
+        files = 0
+        adds = 0
+        dels = 0
+        for line in self._diff.splitlines():
+            if line.startswith("+++ ") and not line.startswith("+++ /dev/null"):
+                files += 1
+            elif line.startswith("+") and not line.startswith("+++"):
+                adds += 1
+            elif line.startswith("-") and not line.startswith("---"):
+                dels += 1
+        plural = "" if files == 1 else "s"
+        return (
+            f"[dim]{self._title}[/]  ·  "
+            f"[#4ade80]+{adds}[/] [#f87171]−{dels}[/] "
+            f"[dim]in {files} file{plural}[/]"
+        )
+
     def compose(self) -> ComposeResult:
+        from rich.syntax import Syntax
+
         with Vertical(id="diff-view"):
-            yield Static(self._title, classes="column-header")
-            yield VerticalScroll(
-                Static(self._diff or "No changes.", id="diff-content"),
-            )
+            yield Static(self._summary(), id="diff-header")
+            if self._diff:
+                body = Syntax(
+                    self._diff,
+                    "diff",
+                    theme="ansi_dark",
+                    line_numbers=False,
+                    word_wrap=False,
+                    background_color="default",
+                )
+                yield VerticalScroll(Static(body, id="diff-content"), id="diff-scroll")
+            else:
+                yield VerticalScroll(
+                    Static("[dim]No changes.[/]", id="diff-content"),
+                    id="diff-scroll",
+                )
+
+    def _scroll(self):
+        return self.query_one("#diff-scroll", VerticalScroll)
+
+    def action_scroll_down(self) -> None:
+        self._scroll().scroll_down(animate=False)
+
+    def action_scroll_up(self) -> None:
+        self._scroll().scroll_up(animate=False)
+
+    def action_page_down(self) -> None:
+        self._scroll().scroll_page_down(animate=False)
+
+    def action_page_up(self) -> None:
+        self._scroll().scroll_page_up(animate=False)
+
+    def action_scroll_home(self) -> None:
+        self._scroll().scroll_home(animate=False)
+
+    def action_scroll_end(self) -> None:
+        self._scroll().scroll_end(animate=False)
 
     def action_close(self) -> None:
         self.dismiss(None)

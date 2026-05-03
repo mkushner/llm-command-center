@@ -7,8 +7,9 @@ Verifies that when a task has worktree_path set:
 - Branch mode falls through to project_path correctly
 """
 
-import pytest
 from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 from llm_cc.models import (
     AgentConfig,

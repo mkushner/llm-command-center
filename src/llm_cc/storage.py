@@ -11,7 +11,6 @@ from pathlib import Path
 
 from .models import (
     AgentConfig,
-    AgentMode,
     GlobalConfig,
     MergedConfig,
     PipelineStage,

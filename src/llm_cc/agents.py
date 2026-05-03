@@ -1,4 +1,4 @@
-"""Agent system: backend protocol, PTY/API backends, registry."""
+"""Agent system: backend protocol, tmux/API backends, registry."""
 
 from __future__ import annotations
 
@@ -6,19 +6,17 @@ import asyncio
 import atexit
 import json
 import os
+import re
 import shlex
 import shutil
 import time
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-import pyte
-from rich.style import Style
 from rich.text import Text
 
 from .health import AgentHealth, HealthScorer, SessionStore
-from .models import AgentConfig, AgentMode, Task, TaskStatus
-
+from .models import AgentConfig, AgentMode, Task
 
 # --- Protocol ---
 
@@ -68,14 +66,25 @@ _COMPLETE_PATTERNS = (
 
 
 class OutputBuffer:
-    """Terminal emulator buffer. Uses pyte to properly decode PTY output."""
+    """Terminal output buffer.
+
+    Two write paths:
+    - `set_capture(plain, viewport_ansi, history_ansi)` — used by TmuxBackend with
+      tmux's own emulator output via capture-pane. tmux did the rendering.
+    - `append(data)` — used by ApiBackend for plain-text completions; also the
+      path for tests. Data is appended verbatim and the viewport is bounded to
+      the configured row height so heuristics over a "screen" still work.
+    """
 
     def __init__(self, log_path: Path | None = None, cols: int = 120, rows: int = 40) -> None:
-        self._screen = pyte.HistoryScreen(cols, rows, history=5000)
-        self._stream = pyte.Stream(self._screen)
+        self._cols = cols
+        self._rows = rows
+        self._plain_viewport: str = ""
+        self._ansi_viewport: str = ""
+        self._ansi_history: str = ""
         self._log_file = None
         self._last_content: str = ""
-        self._stable_ticks: int = 0  # how many polls the screen hasn't changed
+        self._stable_ticks: int = 0
         self._total_bytes: int = 0
         self._last_output_time: float = 0.0
         if log_path:
@@ -83,12 +92,26 @@ class OutputBuffer:
             self._log_file = open(log_path, "a")
 
     def append(self, data: str) -> None:
-        self._stream.feed(data)
+        """Append plain text. Used by ApiBackend and by tests."""
+        self._plain_viewport += data
+        # Bound the viewport to last `rows` lines — mimics screen scrolling
+        # so substring patterns scroll off correctly under append-only writes.
+        lines = self._plain_viewport.split("\n")
+        if len(lines) > self._rows:
+            self._plain_viewport = "\n".join(lines[-self._rows:])
+        self._ansi_viewport = self._plain_viewport
         self._total_bytes += len(data)
         self._last_output_time = time.monotonic()
         if self._log_file:
             self._log_file.write(data)
             self._log_file.flush()
+
+    def set_capture(self, plain: str, viewport_ansi: str, history_ansi: str) -> None:
+        """Replace internal state from a tmux capture-pane snapshot."""
+        self._plain_viewport = plain
+        self._ansi_viewport = viewport_ansi
+        self._ansi_history = history_ansi
+        self._last_output_time = time.monotonic()
 
     @property
     def stats(self) -> tuple[int, float, int]:
@@ -105,123 +128,37 @@ class OutputBuffer:
             self._stable_ticks = 0
 
     def display(self) -> str:
-        """Get the current screen content as clean text."""
-        lines = self._screen.display
-        # Strip trailing whitespace from each line, drop trailing empty lines
-        cleaned = [line.rstrip() for line in lines]
+        """Current viewport as clean plain text, trailing whitespace trimmed."""
+        text = self._plain_viewport.replace("\r\n", "\n").replace("\r", "\n")
+        cleaned = [line.rstrip() for line in text.split("\n")]
         while cleaned and not cleaned[-1]:
             cleaned.pop()
         return "\n".join(cleaned)
 
-    @staticmethod
-    def _pyte_color_to_rich(color: str, background: bool = False) -> str:
-        """Convert a pyte color value to a Rich style string."""
-        if color == "default" or not color:
-            return ""
-        # Named colors — Rich supports them directly
-        named = {
-            "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white",
-            "bright_black", "bright_red", "bright_green", "bright_yellow",
-            "bright_blue", "bright_magenta", "bright_cyan", "bright_white",
-        }
-        # pyte uses "brown" for yellow sometimes
-        if color == "brown":
-            color = "yellow"
-        if color in named:
-            return f"on {color}" if background else color
-        # Hex color string (256-color or truecolor, e.g. "ff8700")
-        if len(color) == 6:
-            try:
-                int(color, 16)
-                return f"on #{color}" if background else f"#{color}"
-            except ValueError:
-                pass
-        return ""
-
-    def _row_to_rich(self, row: dict) -> Text:
-        """Convert a pyte screen row (dict of col -> Char) to a Rich Text."""
-        if not row:
-            return Text("")
-        max_col = max(row.keys()) if row else 0
-        result = Text()
-        span_chars: list[str] = []
-        span_style: Style | None = None
-
-        for col in range(max_col + 1):
-            char = row.get(col)
-            if char is None:
-                ch = " "
-                fg_str = ""
-                bg_str = ""
-                bold = False
-                italic = False
-            else:
-                ch = char.data if char.data else " "
-                fg_str = self._pyte_color_to_rich(char.fg)
-                bg_str = self._pyte_color_to_rich(char.bg, background=True)
-                bold = char.bold
-                italic = char.italics
-
-            parts = [s for s in (fg_str, bg_str) if s]
-            if bold:
-                parts.append("bold")
-            if italic:
-                parts.append("italic")
-            style = Style.parse(" ".join(parts)) if parts else Style.null()
-
-            if style == span_style:
-                span_chars.append(ch)
-            else:
-                if span_chars:
-                    result.append("".join(span_chars), span_style)
-                span_chars = [ch]
-                span_style = style
-
-        if span_chars:
-            result.append("".join(span_chars), span_style)
-
-        # Strip trailing whitespace
-        result.rstrip()
-        return result
-
     def display_rich(self) -> Text:
-        """Get current screen content as a Rich Text with ANSI colors preserved."""
-        lines: list[Text] = []
-        for row_idx in range(self._screen.lines):
-            row = self._screen.buffer[row_idx]
-            lines.append(self._row_to_rich(row))
-        # Drop trailing empty lines
-        while lines and not lines[-1].plain.strip():
-            lines.pop()
-        result = Text()
-        for i, line in enumerate(lines):
-            if i > 0:
-                result.append("\n")
-            result.append_text(line)
-        return result
+        """Viewport as Rich Text with ANSI colors preserved."""
+        return Text.from_ansi(self._ansi_viewport.rstrip())
 
     def history_rich(self) -> list[Text]:
-        """Get scrollback history lines as Rich Text objects."""
-        result: list[Text] = []
-        for row in self._screen.history.top:
-            result.append(self._row_to_rich(row))
-        return result
+        """Scrollback history above the viewport, line by line."""
+        if not self._ansi_history:
+            return []
+        return [Text.from_ansi(line) for line in self._ansi_history.splitlines()]
 
     @property
     def total_lines(self) -> int:
-        """Total lines: history + active screen lines."""
-        return len(self._screen.history.top) + self._screen.lines
+        """Total lines: history + viewport."""
+        hist = self._ansi_history.count("\n") if self._ansi_history else 0
+        view = self._plain_viewport.count("\n") + (1 if self._plain_viewport else 0)
+        return hist + view
 
     def resize(self, cols: int, rows: int) -> None:
-        """Resize the virtual terminal."""
-        self._screen.resize(rows, cols)
+        self._cols = cols
+        self._rows = rows
 
     @property
     def appears_stage_complete(self) -> bool:
-        """Agent posted a stage completion marker (e.g., EXECUTE COMPLETE).
-
-        Same stability check as appears_waiting — content must be settled.
-        """
+        """Agent posted a stage completion marker. Requires settled content."""
         if self._stable_ticks < 3:
             return False
         screen_text = self.display().lower()
@@ -233,8 +170,6 @@ class OutputBuffer:
 
         Triggers when the visible screen content hasn't changed for ~0.3s
         AND the screen matches known input prompt patterns.
-        Searches full screen since CLI prompts can render anywhere.
-        The board's 2-second poll interval naturally debounces brief flickers.
         Does NOT trigger for stage completion — that's a separate state.
         """
         if self._stable_ticks < 3:
@@ -245,7 +180,6 @@ class OutputBuffer:
         return any(p in screen_text for p in _INPUT_PATTERNS)
 
     def close(self) -> None:
-        """Close log file if open."""
         if self._log_file:
             try:
                 self._log_file.close()
@@ -254,29 +188,98 @@ class OutputBuffer:
             self._log_file = None
 
 
-# --- PTY Backend ---
+# --- Tmux Backend ---
 
 
-class PtyBackend:
-    """Spawns CLI agents in native pseudo-terminals via pexpect."""
+_TMUX_NAME_BAD = re.compile(r"[^A-Za-z0-9_-]")
+
+
+def _sanitize_session_name(raw: str) -> str:
+    """Tmux disallows `.` and `:` in session names; keep alnum + _ + -."""
+    return _TMUX_NAME_BAD.sub("_", raw)
+
+
+async def _tmux(*args: str) -> tuple[int, bytes, bytes]:
+    """Run a tmux command via execFile semantics. Returns (rc, stdout, stderr)."""
+    proc = await asyncio.create_subprocess_exec(
+        "tmux", *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    out, err = await proc.communicate()
+    return proc.returncode, out, err
+
+
+def _tmux_sync(*args: str) -> tuple[int, bytes]:
+    """Synchronous tmux call (no shell) for is_alive checks and atexit cleanup."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["tmux", *args],
+            capture_output=True,
+            check=False,
+        )
+        return result.returncode, result.stdout
+    except FileNotFoundError:
+        return 127, b""
+
+
+# Map raw escape bytes (as written by AgentPanel) to tmux send-keys names
+_RAW_TO_TMUX_KEY = {
+    "\x03": "C-c",
+    "\x04": "C-d",
+    "\x1a": "C-z",
+    "\r": "Enter",
+    "\n": "Enter",
+    "\t": "Tab",
+    "\x7f": "BSpace",
+    "\x08": "BSpace",
+    "\x1b": "Escape",
+    "\x1b[A": "Up",
+    "\x1b[B": "Down",
+    "\x1b[C": "Right",
+    "\x1b[D": "Left",
+    "\x1b[Z": "BTab",
+    "\x1b[H": "Home",
+    "\x1b[F": "End",
+    "\x1b[1~": "Home",
+    "\x1b[4~": "End",
+    "\x1b[3~": "DC",
+    "\x1b[5~": "PPage",
+    "\x1b[6~": "NPage",
+}
+
+
+class TmuxBackend:
+    """Spawns CLI agents in tmux sessions. tmux owns the PTY layer."""
 
     def __init__(self, process_manager: _ProcessManager | None = None) -> None:
-        self._sessions: dict[str, object] = {}  # session_id -> pexpect.spawn
+        self._sessions: dict[str, str] = {}  # session_id -> tmux session name (same value)
         self._buffers: dict[str, OutputBuffer] = {}
+        self._log_paths: dict[str, Path] = {}
         self._poll_tasks: dict[str, asyncio.Task[None]] = {}
-        self._interrupted: set[str] = set()  # sessions with pending interrupt
+        self._interrupted: set[str] = set()
         self._pm = process_manager
         self._health_scorers: dict[str, HealthScorer] = {}
         self._session_store: SessionStore | None = None
-        self._status_files: dict[str, Path] = {}  # session_id -> status file path
+        self._status_files: dict[str, Path] = {}
 
     def set_session_store(self, store: SessionStore) -> None:
         self._session_store = store
 
-    async def start(self, config: AgentConfig, task: Task, prompt: str, cwd: Path, stage: str = "", cli_flags: str = "", terminal_size: tuple[int, int] | None = None) -> str:
-        import pexpect
-
-        session_id = f"pty_{task.id}_{stage or task.status.value}"
+    async def start(
+        self,
+        config: AgentConfig,
+        task: Task,
+        prompt: str,
+        cwd: Path,
+        stage: str = "",
+        cli_flags: str = "",
+        terminal_size: tuple[int, int] | None = None,
+    ) -> str:
+        session_id = _sanitize_session_name(
+            f"llmcc_{task.id}_{stage or task.status.value}"
+        )
 
         # Stop old session if same ID exists (prevents orphans)
         if session_id in self._sessions:
@@ -314,10 +317,13 @@ class PtyBackend:
         parts = [config.command, model_flag, allowed_flag, full_auto_flag, cli_flags, cmd_args]
         full_cmd = " ".join(p for p in parts if p).strip()
 
-        # Log path
+        # Log path — pipe-pane streams the pane's raw output here
         log_path = cwd / ".llm-cc" / "logs" / f"{session_id}.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        # Truncate any prior log so the tailer starts fresh at offset 0
+        log_path.write_bytes(b"")
 
-        # Terminal dimensions — use provided size, real terminal, or defaults
+        # Terminal dimensions
         if terminal_size:
             cols, rows = terminal_size
         else:
@@ -327,25 +333,39 @@ class PtyBackend:
             except OSError:
                 cols, rows = 120, 40
 
-        # Clean env: allow nested Claude sessions from TUI
-        spawn_env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
-        spawn_env["LLM_CC_TASK_ID"] = task.id
-
         # Track status file for statusline data
         self._status_files[session_id] = cwd / ".llm-cc" / "status" / f"{task.id}.json"
 
-        # Spawn in PTY
-        child = pexpect.spawn(
-            full_cmd,
-            cwd=str(cwd),
-            encoding="utf-8",
-            timeout=None,
-            dimensions=(rows, cols),
-            env=spawn_env,
-        )
+        # Compose env — pass LLM_CC_TASK_ID, drop CLAUDECODE so nested claude works
+        env_args: list[str] = []
+        for k, v in os.environ.items():
+            if k == "CLAUDECODE":
+                continue
+            env_args += ["-e", f"{k}={v}"]
+        env_args += ["-e", f"LLM_CC_TASK_ID={task.id}"]
 
-        self._sessions[session_id] = child
-        self._buffers[session_id] = OutputBuffer(log_path=log_path, cols=cols, rows=rows)
+        # Spawn detached tmux session running the agent command
+        rc, _, err = await _tmux(
+            "new-session",
+            "-d",
+            "-s", session_id,
+            "-x", str(cols),
+            "-y", str(rows),
+            "-c", str(cwd),
+            *env_args,
+            full_cmd,
+        )
+        if rc != 0:
+            raise RuntimeError(f"tmux new-session failed: {err.decode(errors='replace').strip()}")
+
+        # Stream pane output to the log file (raw, including ANSI escapes)
+        pipe_cmd = f"cat >> {shlex.quote(str(log_path))}"
+        await _tmux("pipe-pane", "-t", session_id, "-o", pipe_cmd)
+
+        self._sessions[session_id] = session_id
+        # OutputBuffer log_path is None — pipe-pane is the sole writer.
+        self._buffers[session_id] = OutputBuffer(log_path=None, cols=cols, rows=rows)
+        self._log_paths[session_id] = log_path
         self._health_scorers[session_id] = HealthScorer()
 
         # Create session context for persistence
@@ -354,24 +374,104 @@ class PtyBackend:
                 session_id, task.id, stage or task.status.value, config.name,
             )
 
-        # Register with process manager for crash cleanup
-        if self._pm:
-            self._pm.register(session_id, child)
+        # Register with process manager only in --clean-exit mode; otherwise
+        # the session is allowed to outlive llm-cc.
+        if self._pm and _clean_exit_mode:
+            self._pm.register(session_id, session_id)
 
-        # Start polling output in background
+        # Tail the pipe-pane log into OutputBuffer
         self._poll_tasks[session_id] = asyncio.create_task(
-            self._poll_output(session_id, child)
+            self._poll_output(session_id, log_path)
         )
 
         return session_id
 
     async def resume(self, session_id: str, prompt: str) -> None:
-        child = self._sessions.get(session_id)
-        if child and hasattr(child, "sendline"):
+        if session_id in self._sessions:
+            await self.send_input(session_id, prompt)
+
+    async def reattach(
+        self,
+        session_id: str,
+        task: Task,
+        cwd: Path,
+        stage: str = "",
+        agent_name: str = "",
+    ) -> bool:
+        """Re-register an existing tmux session that survived an llm-cc restart.
+
+        Returns True if the tmux session is alive and was reattached, False if
+        it's gone (caller should clear `task.session_id`).
+        """
+        if session_id in self._sessions:
+            return True
+        rc, _ = _tmux_sync("has-session", "-t", session_id)
+        if rc != 0:
+            return False
+
+        log_path = cwd / ".llm-cc" / "logs" / f"{session_id}.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        if not log_path.exists():
+            log_path.write_bytes(b"")
+        # Re-arm pipe-pane in case the previous llm-cc process owned it
+        pipe_cmd = f"cat >> {shlex.quote(str(log_path))}"
+        await _tmux("pipe-pane", "-t", session_id, "-o", pipe_cmd)
+
+        try:
+            ts = os.get_terminal_size()
+            cols, rows = ts.columns, ts.lines
+        except OSError:
+            cols, rows = 120, 40
+
+        self._sessions[session_id] = session_id
+        self._buffers[session_id] = OutputBuffer(log_path=None, cols=cols, rows=rows)
+        self._log_paths[session_id] = log_path
+        self._health_scorers[session_id] = HealthScorer()
+        self._status_files[session_id] = cwd / ".llm-cc" / "status" / f"{task.id}.json"
+
+        if self._session_store:
+            self._session_store.get_or_create(
+                session_id, task.id, stage or task.status.value, agent_name,
+            )
+
+        if self._pm and _clean_exit_mode:
+            self._pm.register(session_id, session_id)
+
+        self._poll_tasks[session_id] = asyncio.create_task(
+            self._poll_output(session_id, log_path)
+        )
+        return True
+
+    async def detach(self, session_id: str) -> None:
+        """Tear down local state without killing the tmux session.
+
+        Used at app shutdown so sessions persist for the next launch.
+        """
+        poll = self._poll_tasks.pop(session_id, None)
+        if poll:
+            poll.cancel()
             try:
-                child.sendline(prompt)
-            except Exception:
+                await poll
+            except asyncio.CancelledError:
                 pass
+
+        self._sessions.pop(session_id, None)
+        if self._pm:
+            self._pm.unregister(session_id)
+
+        # Status file stays on disk — the underlying agent process is still
+        # writing to it.
+        self._status_files.pop(session_id, None)
+        self._health_scorers.pop(session_id, None)
+        if self._session_store:
+            self._session_store.flush_force(session_id)
+            self._session_store.remove(session_id)
+
+        self._interrupted.discard(session_id)
+        self._log_paths.pop(session_id, None)
+        buf = self._buffers.pop(session_id, None)
+        if buf:
+            buf.close()
 
     async def stop(self, session_id: str) -> None:
         # Cancel poll task
@@ -383,16 +483,14 @@ class PtyBackend:
             except asyncio.CancelledError:
                 pass
 
-        # Terminate process (in thread to avoid blocking event loop)
-        child = self._sessions.pop(session_id, None)
-        if child and hasattr(child, "isalive") and child.isalive():
-            await asyncio.to_thread(self._kill_child, child)
+        # Kill tmux session (idempotent — tmux returns non-zero if already gone)
+        name = self._sessions.pop(session_id, None)
+        if name:
+            await _tmux("kill-session", "-t", name)
 
-        # Unregister from process manager
         if self._pm:
             self._pm.unregister(session_id)
 
-        # Clean up status file
         status_file = self._status_files.pop(session_id, None)
         if status_file and status_file.exists():
             try:
@@ -400,50 +498,47 @@ class PtyBackend:
             except Exception:
                 pass
 
-        # Clean up health scorer and session context
         self._health_scorers.pop(session_id, None)
         if self._session_store:
             self._session_store.flush_force(session_id)
             self._session_store.remove(session_id)
 
-        # Clean up buffer and interrupt flag
         self._interrupted.discard(session_id)
+        self._log_paths.pop(session_id, None)
         buf = self._buffers.pop(session_id, None)
         if buf:
             buf.close()
 
-    @staticmethod
-    def _kill_child(child: object) -> None:
-        """Terminate a pexpect child process. Runs in a thread."""
-        try:
-            child.terminate(force=True)
-            child.wait()
-        except Exception:
-            pass
-
     async def send_input(self, session_id: str, text: str) -> None:
-        child = self._sessions.get(session_id)
-        if child and hasattr(child, "sendline") and child.isalive():
-            try:
-                child.sendline(text)
-                self._interrupted.discard(session_id)
-            except Exception:
-                pass
+        if session_id not in self._sessions or not self.is_alive(session_id):
+            return
+        if text:
+            # -l sends the literal bytes (no key-name interpretation)
+            await _tmux("send-keys", "-t", session_id, "-l", text)
+        await _tmux("send-keys", "-t", session_id, "Enter")
+        self._interrupted.discard(session_id)
 
     async def send_raw(self, session_id: str, data: str) -> None:
-        """Send raw bytes to PTY. Used by AgentPanel for key forwarding."""
-        child = self._sessions.get(session_id)
-        if child and hasattr(child, "send") and child.isalive():
-            try:
-                child.send(data)
-                if data == "\x03":
-                    # Ctrl+C interrupt — mark as waiting immediately
-                    self._interrupted.add(session_id)
-                else:
-                    # User responding — clear interrupt flag
-                    self._interrupted.discard(session_id)
-            except Exception:
-                pass
+        """Translate raw escape bytes from AgentPanel to tmux send-keys."""
+        if session_id not in self._sessions or not self.is_alive(session_id):
+            return
+
+        key_name = _RAW_TO_TMUX_KEY.get(data)
+        if key_name:
+            await _tmux("send-keys", "-t", session_id, key_name)
+        elif data.isprintable():
+            # Single char or pasted text — send literally
+            await _tmux("send-keys", "-t", session_id, "-l", data)
+        else:
+            # Unknown escape sequence — send each byte by hex
+            hex_args = [f"{b:02x}" for b in data.encode("utf-8")]
+            if hex_args:
+                await _tmux("send-keys", "-t", session_id, "-H", *hex_args)
+
+        if data == "\x03":
+            self._interrupted.add(session_id)
+        else:
+            self._interrupted.discard(session_id)
 
     async def get_output(self, session_id: str) -> str:
         buf = self._buffers.get(session_id)
@@ -458,35 +553,32 @@ class PtyBackend:
         return buf.history_rich() if buf else []
 
     def resize_session(self, session_id: str, cols: int, rows: int) -> None:
-        """Resize PTY and virtual terminal buffer for a session."""
+        """Resize tmux window and the virtual terminal buffer."""
         buf = self._buffers.get(session_id)
         if buf:
             buf.resize(cols, rows)
-        child = self._sessions.get(session_id)
-        if child and hasattr(child, "setwinsize"):
-            try:
-                child.setwinsize(rows, cols)
-            except Exception:
-                pass
+        if session_id in self._sessions:
+            asyncio.create_task(
+                _tmux("resize-window", "-t", session_id, "-x", str(cols), "-y", str(rows))
+            )
 
     def is_alive(self, session_id: str) -> bool:
-        child = self._sessions.get(session_id)
-        return child is not None and hasattr(child, "isalive") and child.isalive()
+        if session_id not in self._sessions:
+            return False
+        rc, _ = _tmux_sync("has-session", "-t", session_id)
+        return rc == 0
 
     def is_stage_complete(self, session_id: str) -> bool:
-        """True if agent posted a stage completion marker."""
         buf = self._buffers.get(session_id)
         return buf.appears_stage_complete if buf else False
 
     def is_waiting_for_input(self, session_id: str) -> bool:
-        # Ctrl+C interrupt — immediately waiting until agent responds
         if session_id in self._interrupted:
             return True
         buf = self._buffers.get(session_id)
         return buf.appears_waiting if buf else False
 
     def health(self, session_id: str) -> AgentHealth | None:
-        """Compute current health for a session."""
         scorer = self._health_scorers.get(session_id)
         buf = self._buffers.get(session_id)
         if not scorer or not buf:
@@ -497,7 +589,6 @@ class PtyBackend:
         status_data = self._read_status_file(session_id)
         h = scorer.compute(alive, stable_ticks, screen_text, status_data)
 
-        # Record health event in session context
         if self._session_store:
             ctx = self._session_store.get(session_id)
             if ctx:
@@ -510,7 +601,6 @@ class PtyBackend:
         return h
 
     def status_data(self, session_id: str) -> dict | None:
-        """Public access to statusline data for a session."""
         return self._read_status_file(session_id)
 
     def _read_status_file(self, session_id: str) -> dict | None:
@@ -527,60 +617,88 @@ class PtyBackend:
         return scorer.context_monitor.warning_level
 
     def active_session_ids(self) -> list[str]:
-        """List all active session IDs."""
         return list(self._sessions.keys())
 
-    async def _poll_output(self, session_id: str, child: object) -> None:
-        """Read PTY output and feed into buffer."""
-        import pexpect
-
+    async def _poll_output(self, session_id: str, log_path: Path) -> None:
+        """Periodic capture-pane snapshots → OutputBuffer; tail log for activity."""
         buf = self._buffers.get(session_id)
         if not buf:
             return
-        while True:
-            try:
-                # Check if child is dead — break instead of spinning forever
-                if hasattr(child, "isalive") and not child.isalive():
-                    # Read remaining output
-                    try:
-                        remaining = child.read_nonblocking(size=4096, timeout=0)
-                        if remaining:
-                            buf.append(remaining)
-                    except Exception:
-                        pass
-                    break
 
-                # Non-blocking read
-                if hasattr(child, "read_nonblocking"):
-                    data = child.read_nonblocking(size=4096, timeout=0)
+        # Wait briefly for pipe-pane to attach so log_path exists
+        for _ in range(20):
+            if log_path.exists():
+                break
+            await asyncio.sleep(0.05)
+
+        try:
+            log_fd = log_path.open("rb")
+        except OSError:
+            log_fd = None
+
+        try:
+            while True:
+                # Activity tracking: read whatever pipe-pane has appended.
+                # We don't feed it into OutputBuffer (capture-pane is the source
+                # of truth for rendering); we just count bytes for health scoring
+                # and record an excerpt for the session log.
+                if log_fd is not None:
+                    try:
+                        data = log_fd.read()
+                    except Exception:
+                        data = b""
                     if data:
-                        buf.append(data)
-                        # Record for health scoring
                         scorer = self._health_scorers.get(session_id)
                         if scorer:
                             scorer.record_output(len(data))
-                        # Record output event in session context
                         if self._session_store:
                             ctx = self._session_store.get(session_id)
                             if ctx:
-                                ctx.add_event("output", {"text": data[-200:]})
-                        # Respond to cursor position queries (DSR).
-                        # CLIs like codex send \x1b[6n to detect terminal size.
-                        if "\x1b[6n" in data:
-                            row = buf._screen.cursor.y + 1
-                            col = buf._screen.cursor.x + 1
-                            child.send(f"\x1b[{row};{col}R")
-                # Always check screen stability — even when raw data flows
-                # (cursor blinks, escape codes), the rendered content may be stable
+                                excerpt = data[-200:].decode("utf-8", errors="replace")
+                                ctx.add_event("output", {"text": excerpt})
+
+                alive = self.is_alive(session_id)
+                if alive:
+                    plain, viewport_ansi, history_ansi = await self._capture(session_id)
+                    if plain is not None:
+                        buf.set_capture(plain, viewport_ansi or "", history_ansi or "")
+
                 buf.mark_idle()
 
-            except pexpect.TIMEOUT:
-                buf.mark_idle()
-            except pexpect.EOF:
-                break
-            except Exception:
-                break
-            await asyncio.sleep(0.1)
+                if not alive:
+                    # Final drain of activity log, then stop
+                    if log_fd is not None:
+                        try:
+                            tail = log_fd.read()
+                        except Exception:
+                            tail = b""
+                        if tail:
+                            scorer = self._health_scorers.get(session_id)
+                            if scorer:
+                                scorer.record_output(len(tail))
+                    break
+
+                await asyncio.sleep(0.2)
+        finally:
+            if log_fd is not None:
+                try:
+                    log_fd.close()
+                except Exception:
+                    pass
+
+    async def _capture(self, session_id: str) -> tuple[str | None, str | None, str | None]:
+        """Return (plain_viewport, ansi_viewport, ansi_history) via capture-pane."""
+        rc1, plain_b, _ = await _tmux("capture-pane", "-t", session_id, "-p")
+        if rc1 != 0:
+            return None, None, None
+        rc2, ansi_b, _ = await _tmux("capture-pane", "-t", session_id, "-e", "-p")
+        rc3, hist_b, _ = await _tmux(
+            "capture-pane", "-t", session_id, "-e", "-p", "-S", "-5000", "-E", "-1",
+        )
+        plain = plain_b.decode("utf-8", errors="replace")
+        viewport_ansi = ansi_b.decode("utf-8", errors="replace") if rc2 == 0 else plain
+        history_ansi = hist_b.decode("utf-8", errors="replace") if rc3 == 0 else ""
+        return plain, viewport_ansi, history_ansi
 
 
 
@@ -711,35 +829,55 @@ class ApiBackend:
 
 
 class _ProcessManager:
-    """Track child processes for clean shutdown on crash/signal."""
+    """Track tmux session names for clean shutdown on crash/signal."""
 
     def __init__(self) -> None:
-        self._children: dict[str, object] = {}
+        self._sessions: dict[str, str] = {}  # session_id -> tmux session name
 
-    def register(self, session_id: str, child: object) -> None:
-        self._children[session_id] = child
+    def register(self, session_id: str, tmux_name: str) -> None:
+        self._sessions[session_id] = tmux_name
 
     def unregister(self, session_id: str) -> None:
-        self._children.pop(session_id, None)
+        self._sessions.pop(session_id, None)
 
     def cleanup_all(self) -> None:
-        """Terminate all tracked child processes. Safe to call from atexit."""
-        for sid, child in list(self._children.items()):
-            try:
-                if hasattr(child, "isalive") and child.isalive():
-                    child.terminate(force=True)
-                    try:
-                        child.wait()
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-        self._children.clear()
+        """Kill all tracked tmux sessions. Safe to call from atexit."""
+        for _sid, name in list(self._sessions.items()):
+            _tmux_sync("kill-session", "-t", name)
+        self._sessions.clear()
 
 
-# Singleton — shared between PtyBackend and atexit handler
+# Singleton — shared between TmuxBackend and atexit handler.
+# Sessions are registered with this manager only when --clean-exit is on,
+# so by default tmux sessions outlive an llm-cc shutdown and can be
+# reattached on the next startup.
 _process_manager = _ProcessManager()
 atexit.register(_process_manager.cleanup_all)
+
+_clean_exit_mode: bool = False
+
+
+def set_clean_exit_mode(enabled: bool) -> None:
+    """When enabled, tmux sessions are killed at llm-cc shutdown.
+
+    Off by default so sessions persist across crashes / quits and can be
+    reattached on the next startup.
+    """
+    global _clean_exit_mode
+    _clean_exit_mode = enabled
+
+
+def is_clean_exit_mode() -> bool:
+    return _clean_exit_mode
+
+
+async def list_llmcc_sessions() -> list[str]:
+    """Return tmux session names matching the llm-cc prefix."""
+    rc, out, _ = await _tmux("list-sessions", "-F", "#{session_name}")
+    if rc != 0:
+        return []
+    names = out.decode("utf-8", errors="replace").splitlines()
+    return [n for n in names if n.startswith("llmcc_")]
 
 
 # --- Registry ---
@@ -750,7 +888,7 @@ class AgentRegistry:
 
     def __init__(self, agents: dict[str, AgentConfig], sessions_dir: Path | None = None) -> None:
         self._configs = agents
-        self._pty = PtyBackend(process_manager=_process_manager)
+        self._pty = TmuxBackend(process_manager=_process_manager)
         self._api = ApiBackend()
         self._session_store: SessionStore | None = None
         if sessions_dir:
@@ -802,7 +940,7 @@ class AgentRegistry:
             await self._api.stop(session_id)
 
     async def cleanup_all(self) -> None:
-        """Terminate all sessions. Called on app exit."""
+        """Terminate all sessions. Called on app exit when --clean-exit is set."""
         # Flush session store before stopping
         if self._session_store:
             self._session_store.flush_all()
@@ -813,3 +951,62 @@ class AgentRegistry:
         tasks += [self._api.stop(sid) for sid in api_sids]
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def detach_all(self) -> None:
+        """Release local handles without killing tmux sessions.
+
+        Default app-shutdown path so agents survive an llm-cc restart.
+        ApiBackend has no out-of-process equivalent, so its sessions are
+        stopped (cancelled) regardless.
+        """
+        if self._session_store:
+            self._session_store.flush_all()
+        pty_sids = self._pty.active_session_ids()
+        api_sids = self._api.active_session_ids()
+        coros = [self._pty.detach(sid) for sid in pty_sids]
+        coros += [self._api.stop(sid) for sid in api_sids]
+        if coros:
+            await asyncio.gather(*coros, return_exceptions=True)
+
+    async def reattach_existing(self, project_path: Path) -> tuple[int, list[str]]:
+        """Scan tmux for live llmcc-* sessions and re-register them.
+
+        Returns (reattached_count, orphan_session_names). Orphans are tmux
+        sessions whose name doesn't match any task's session_id (left alone).
+        """
+        from llm_cc.storage import Storage
+
+        storage = Storage(project_path)
+        store = storage.load_tasks()
+        tasks_by_session = {
+            t.session_id: t for t in store.tasks if t.session_id
+        }
+
+        live_names = await list_llmcc_sessions()
+        live_set = set(live_names)
+
+        reattached = 0
+        orphans: list[str] = []
+        cleared = False
+
+        for name in live_names:
+            task = tasks_by_session.get(name)
+            if task is None:
+                orphans.append(name)
+                continue
+            ok = await self._pty.reattach(name, task, project_path, stage=task.status.value)
+            if ok:
+                reattached += 1
+
+        # Clear session_id on tasks whose tmux session is gone
+        for task in store.tasks:
+            if task.session_id and task.session_id not in live_set:
+                task.session_id = None
+                storage.save_task(task)
+                cleared = True
+
+        if cleared:
+            # save_task already persisted; no-op marker for callers that care
+            pass
+
+        return reattached, orphans

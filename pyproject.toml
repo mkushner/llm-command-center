@@ -7,8 +7,6 @@ license = "MIT"
 dependencies = [
     "textual>=1.0",
     "pydantic>=2.0",
-    "pexpect>=4.9",
-    "pyte>=0.8",
 ]
 
 [project.optional-dependencies]
