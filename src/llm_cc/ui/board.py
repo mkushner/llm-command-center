@@ -14,7 +14,7 @@ from textual.screen import Screen
 from textual.widgets import Footer, Static, TabbedContent, TabPane
 
 from llm_cc.agents import AgentRegistry, TmuxBackend
-from llm_cc.models import Task, TaskStatus
+from llm_cc.models import MergedConfig, PipelineStage, Task, TaskStatus
 from llm_cc.pipeline import PipelineEngine
 from llm_cc.storage import Storage
 from llm_cc.ui.panels import (
@@ -42,11 +42,21 @@ class TaskCard(Static, can_focus=False):
             self.column_idx = column_idx
             self.task_idx = task_idx
 
-    def __init__(self, task_data: Task, column_idx: int, task_idx: int) -> None:
+    def __init__(
+        self,
+        task_data: Task,
+        column_idx: int,
+        task_idx: int,
+        *,
+        agent_label: str = "",
+        brainstorm_text: str | None = None,
+    ) -> None:
         super().__init__()
         self.task_data = task_data
         self.column_idx = column_idx
         self.task_idx = task_idx
+        self.agent_label = agent_label  # resolved stage agent (honors task override)
+        self.brainstorm_text = brainstorm_text  # e.g. "cycle 2/3 · critic" or "summarizing"
         self.waiting_for_input = False
         self.stage_complete = False
         self.health_score: int | None = None
@@ -68,17 +78,35 @@ class TaskCard(Static, can_focus=False):
             and not self.task_data.session_id
         )
 
+    def _status_chip(self) -> tuple[str, str, str] | None:
+        """Resolve the single status chip for this card.
+
+        Returns (glyph, color, label) or None for idle/no-status.
+        Priority: Error > Restart > Ready > Waiting > Running.
+        """
+        if self.top_error and self.task_data.session_id:
+            return ("⚠", "#f87171", f"Error: {self.top_error}")
+        if self.is_stale:
+            return ("●", "#f87171", "Needs restart")
+        if self.stage_complete:
+            return ("●", "#fb923c", "Ready")
+        if self.waiting_for_input:
+            return ("●", "#fbbf24", "Waiting")
+        if self.task_data.session_id:
+            return ("●", "#4ade80", "Running")
+        return None
+
     def render(self) -> str:
         t = self.task_data
         lines: list[str] = []
 
-        # Line 1: title with status glyph (no redundant border-conveyed words)
-        if self.is_stale:
-            lines.append(f"[dim]{t.title}[/]  [red]stale[/]")
-        elif self.stage_complete:
-            lines.append(f"[bold]{t.title}[/]  [#fb923c]✓ ready[/]")
-        elif self.waiting_for_input:
-            lines.append(f"[bold]{t.title}[/]  [yellow]⏸ waiting[/]")
+        chip = self._status_chip()
+        # Line 1: title (+ status glyph and chip label only if there's a status)
+        if chip:
+            glyph, color, label = chip
+            lines.append(
+                f"[{color}]{glyph}[/] [bold]{t.title}[/]  [{color}]{label}[/]"
+            )
         else:
             lines.append(f"[bold]{t.title}[/]")
 
@@ -89,11 +117,17 @@ class TaskCard(Static, can_focus=False):
                 d = d[:49] + "…"
             lines.append(f"[dim]{d}[/]")
 
-        # Line 3: telemetry (only when a live session exists)
+        # Line 3: brainstorm cycle (only during active brainstorm)
+        if self.brainstorm_text and t.session_id:
+            lines.append(f"[#8b9eff]{self.brainstorm_text}[/]")
+
+        # Line 4: telemetry (only when a live session exists)
         if t.session_id and not self.is_stale:
             parts: list[str] = []
-            agent_label = t.agent_override or "agent"
-            score_part = f"[dim]{agent_label}[/]"
+            if self.agent_label:
+                score_part = f"[dim]{self.agent_label}[/]"
+            else:
+                score_part = "[dim]agent[/]"
             if self.health_score is not None:
                 score_part += f" [{self.health_color}]{self.health_score}[/]"
             parts.append(score_part)
@@ -104,10 +138,6 @@ class TaskCard(Static, can_focus=False):
             if self.total_tokens is not None:
                 parts.append(f"[dim]{self.total_tokens / 1000:.0f}k[/]")
             lines.append("  ".join(parts))
-
-        # Line 4: top error (only if present)
-        if self.top_error and t.session_id:
-            lines.append(f"[red]⚠ {self.top_error}[/]")
 
         return "\n".join(lines)
 
@@ -133,6 +163,8 @@ class KanbanColumn(VerticalScroll, can_focus=False):
     def __init__(
         self, status: TaskStatus, label: str, col_idx: int = 0,
         agent_name: str = "", model_name: str = "",
+        config: MergedConfig | None = None,
+        stage: PipelineStage | None = None,
     ) -> None:
         super().__init__()
         self.status = status
@@ -140,8 +172,29 @@ class KanbanColumn(VerticalScroll, can_focus=False):
         self.col_idx = col_idx
         self.agent_name = agent_name
         self.model_name = model_name
+        self._config = config
+        self._stage = stage
         self._tasks: list[Task] = []
         self._selected: int = 0
+
+    def _resolve_agent_label(self, task: Task) -> str:
+        """Stage-resolved agent name (honors task override). Empty for non-active stages."""
+        if not self._config or task.status not in ACTIVE_STAGES:
+            return ""
+        try:
+            return self._config.agent_for_stage(task.status, task).name
+        except Exception:
+            return ""
+
+    def _resolve_brainstorm_text(self, task: Task) -> str | None:
+        """For brainstorm stages with a live session: 'cycle X/Y · agent' or 'summarizing'."""
+        if not self._stage or not self._stage.is_brainstorm or not task.session_id:
+            return None
+        if task.brainstorm_summarizing:
+            return "summarizing"
+        cycle = task.loop_count + 1
+        agent_name = self._stage.agent_at(task.sub_agent_idx)
+        return f"cycle {cycle}/{self._stage.max_loops} · {agent_name}"
 
     def compose(self) -> ComposeResult:
         yield Static(
@@ -208,7 +261,13 @@ class KanbanColumn(VerticalScroll, can_focus=False):
         header_widget = self.query_one(f"#header-{self.status.value}", Static)
         header_widget.update(self._header_text(len(tasks)))
         for i, task in enumerate(tasks):
-            card = TaskCard(task, self.col_idx, i)
+            card = TaskCard(
+                task,
+                self.col_idx,
+                i,
+                agent_label=self._resolve_agent_label(task),
+                brainstorm_text=self._resolve_brainstorm_text(task),
+            )
             self.mount(card)
         if self._tasks:
             self._selected = min(self._selected, len(self._tasks) - 1)
@@ -263,6 +322,7 @@ class BoardScreen(Screen):
         Binding("ctrl+o", "show_overview", "Overview", show=True),
         Binding("ctrl+right", "next_tab", "Next Agent", show=True),
         Binding("ctrl+left", "prev_tab", "Prev Agent", show=True),
+        Binding("ctrl+w", "close_tab", "Close Tab", show=True, priority=True),
     ]
 
     def __init__(
@@ -296,15 +356,18 @@ class BoardScreen(Screen):
                 with Horizontal(id="kanban-board"):
                     for idx, status in enumerate(self._visible_stages):
                         label = self._config.label_for(status)
+                        stage_cfg = self._config.stage_config(status)
                         agent_cfg = (
                             self._config.agent_for_stage(status)
-                            if self._config.stage_config(status)
+                            if stage_cfg
                             else None
                         )
                         col = KanbanColumn(
                             status, label, col_idx=idx,
                             agent_name=agent_cfg.name if agent_cfg else "",
                             model_name=agent_cfg.model or "" if agent_cfg else "",
+                            config=self._config,
+                            stage=stage_cfg,
                         )
                         self._columns.append(col)
                         yield col
@@ -457,10 +520,12 @@ class BoardScreen(Screen):
             if task.session_id and task.status in ACTIVE_STAGES:
                 active_sessions[task.session_id] = task
 
-        # Add new tabs for live agents (don't steal focus from current tab)
-        for sid, task in active_sessions.items():
-            if sid not in self._open_tabs:
-                self._open_agent_tab(task, focus=False)
+        # Auto-open tabs for live agents (off by default to avoid clutter; opt-in
+        # via project.auto_open_agent_tabs). Users can always open with Enter.
+        if self._config.project.auto_open_agent_tabs:
+            for sid, task in active_sessions.items():
+                if sid not in self._open_tabs:
+                    self._open_agent_tab(task, focus=False)
 
         # Close tabs whose sessions are gone
         for sid in list(self._open_tabs.keys()):
@@ -501,21 +566,32 @@ class BoardScreen(Screen):
                     pass
 
     def _update_aggregate_header(self) -> None:
-        running = waiting = errors = 0
+        running = waiting = errors = ready = 0
+        execute_active = 0
         for col in self._columns:
             for card in col.query(TaskCard):
                 if not card.task_data.session_id:
                     continue
                 running += 1
-                if card.waiting_for_input or card.stage_complete:
-                    waiting += 1
+                if col.status == TaskStatus.EXECUTE:
+                    execute_active += 1
                 if card.top_error:
                     errors += 1
+                elif card.stage_complete:
+                    ready += 1
+                elif card.waiting_for_input:
+                    waiting += 1
+        branch = self._config.project.git.base_branch or "—"
+        left = f"[dim]{branch}  ·  exec {execute_active}[/]"
+        right = (
+            f"[#4ade80]{running} running[/]  "
+            f"[#fbbf24]{waiting} waiting[/]  "
+            f"[#fb923c]{ready} ready[/]  "
+            f"[#f87171]{errors} error[/]"
+        )
         try:
             stats = self.query_one("#board-stats", Static)
-            stats.update(
-                f"[#4ade80]{running} ↑[/]  [#fbbf24]{waiting} ⏸[/]  [#f87171]{errors} ⚠[/]"
-            )
+            stats.update(f"{left}    {right}")
         except Exception:
             pass
 
@@ -619,6 +695,24 @@ class BoardScreen(Screen):
 
     def action_prev_tab(self) -> None:
         self._cycle_tab(-1)
+
+    def action_close_tab(self) -> None:
+        """Close the active agent tab without stopping the underlying tmux session.
+
+        No-op when Overview is active. Reopen any time with Enter on the task.
+        """
+        try:
+            tabs = self.query_one(TabbedContent)
+            active = tabs.active
+        except Exception:
+            return
+        if active == OVERVIEW_PANE_ID:
+            return
+        # Find the session_id whose pane matches the active tab
+        for sid, pane_id in list(self._open_tabs.items()):
+            if pane_id == active:
+                self._close_agent_tab(sid)
+                return
 
     def _cycle_tab(self, delta: int) -> None:
         try:

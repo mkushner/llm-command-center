@@ -1,10 +1,10 @@
 """Auto-permission setup for worktree-isolated agents.
 
-Worktrees created by llm-cc are disposable and isolated — safe to bypass
-permission prompts entirely inside them. This module writes
-`.claude/settings.local.json` (defaultMode: bypassPermissions) into each
-new worktree and arranges for that file to be globally gitignored so it
-doesn't pollute the project's tracked files.
+Worktrees created by llm-cc get a `.claude/settings.local.json` with
+`defaultMode: acceptEdits` so file edits inside the disposable worktree
+auto-approve, while shell/network/dangerous prompts still surface. The
+file is globally gitignored so it doesn't pollute the project's tracked
+files.
 
 Codex is handled separately in `agents.py` via `--full-auto` flag injection.
 No filesystem mutation for Codex.
@@ -19,7 +19,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-CLAUDE_SETTINGS: dict = {"permissions": {"defaultMode": "bypassPermissions"}}
+CLAUDE_SETTINGS: dict = {"permissions": {"defaultMode": "acceptEdits"}}
 CLAUDE_IGNORE_LINE = ".claude/settings.local.json"
 DEFAULT_EXCLUDES_FILE = Path.home() / ".config" / "git" / "ignore"
 GLOBAL_CLAUDE_SETTINGS = Path.home() / ".claude" / "settings.json"

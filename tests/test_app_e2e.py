@@ -65,23 +65,23 @@ async def test_full_flow():
             assert len(cards) == 3
 
             # --- Test 2: Vim navigation ---
-            await pilot.press("]")
+            await pilot.press("right")
             await pilot.pause()
             assert board._active_col == 1
-            print("[3] h/l navigation: OK")
+            print("[3] left/right navigation: OK")
 
-            await pilot.press("[")
+            await pilot.press("left")
             await pilot.pause()
             assert board._active_col == 0
 
-            await pilot.press("j")
+            await pilot.press("down")
             await pilot.pause()
             assert board._columns[0].selected_index == 1
 
-            await pilot.press("k")
+            await pilot.press("up")
             await pilot.pause()
             assert board._columns[0].selected_index == 0
-            print("[4] j/k navigation: OK")
+            print("[4] up/down navigation: OK")
 
             # --- Test 3: Advance task (with git repo) ---
             # Task A is selected in Backlog. Advance to Planning.
@@ -105,7 +105,7 @@ async def test_full_flow():
             # --- Test 4: Advance again (Planning -> Execute) ---
             # Navigate to planning column first
             if task_a.status == TaskStatus.PLANNING:
-                await pilot.press("]")  # go to planning column
+                await pilot.press("right")  # go to planning column
                 await pilot.pause()
                 await pilot.press("m")  # advance to execute
                 await pilot.pause()
@@ -132,7 +132,7 @@ async def test_full_flow():
             # --- Test 6: Create new task ---
             # Go back to backlog
             while board._active_col > 0:
-                await pilot.press("[")
+                await pilot.press("left")
                 await pilot.pause()
 
             await pilot.press("o")
@@ -178,23 +178,23 @@ async def test_full_flow():
             # --- Test 9: Boundary checks ---
             # Try to go left past backlog
             while board._active_col > 0:
-                await pilot.press("[")
+                await pilot.press("left")
                 await pilot.pause()
-            await pilot.press("[")
+            await pilot.press("left")
             await pilot.pause()
             assert board._active_col == 0
             print("[11] Left boundary: OK")
 
             # Try to go right past Done
             for _ in range(10):
-                await pilot.press("]")
+                await pilot.press("right")
                 await pilot.pause()
             assert board._active_col == 4
             print("[12] Right boundary: OK")
 
             # --- Test 10: Diff view (no branch = warning) ---
             while board._active_col > 0:
-                await pilot.press("[")
+                await pilot.press("left")
                 await pilot.pause()
             await pilot.press("d")
             await pilot.pause()

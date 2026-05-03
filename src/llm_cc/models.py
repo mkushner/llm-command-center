@@ -182,6 +182,7 @@ class ProjectConfig(BaseModel):
     plan_file: str = "plan.md"  # constant filename within plan_dir
     review_file: str | None = None  # optional: where review agent writes summary (resolved in plan_dir)
     context_restart_threshold: int = 0  # auto-restart at this % remaining (0 = disabled, trust agent's internal compaction)
+    auto_open_agent_tabs: bool = False  # if true, auto-open a tab for every active session
 
 
 class GlobalConfig(BaseModel):

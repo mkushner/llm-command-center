@@ -42,7 +42,7 @@ def test_write_claude_settings_creates_file(tmp_path):
     f = worktree / ".claude" / "settings.local.json"
     assert f.exists()
     data = json.loads(f.read_text())
-    assert data == {"permissions": {"defaultMode": "bypassPermissions"}}
+    assert data == {"permissions": {"defaultMode": "acceptEdits"}}
 
 
 def test_write_claude_settings_idempotent_does_not_clobber(tmp_path):

@@ -114,56 +114,26 @@ KanbanColumn.-active .column-meta {
     color: $text;
 }
 
-/* --- Task cards (rounded shape via bg-matched corners, no outline) --- */
+/* --- Task cards (neutral surface; status conveyed via in-text glyph) --- */
 
 TaskCard {
     height: auto;
     min-height: 3;
-    max-height: 8;
+    max-height: 10;
     margin: 0 0 1 0;
-    padding: 0 1 0 2;  /* extra left pad reserves space for selection rail */
+    padding: 1 2;
     background: $surface;
     color: $text;
-    border: round $surface;
 }
 
-/* Status tints — bg + matching border so corners stay seamless. */
-
-TaskCard.-has-agent {
-    background: $ok-soft;
-    border: round $ok-soft;
-}
-
-TaskCard.-stage-complete {
-    background: #2a1d10;
-    border: round #2a1d10;
-}
-
-TaskCard.-waiting {
-    background: $warn-soft;
-    border: round $warn-soft;
-}
-
-TaskCard.-degraded {
-    background: $warn-soft;
-    border: round $warn-soft;
-}
-
+/* Stale tasks (active stage, no live session) get a subtler dim. */
 TaskCard.-stale {
-    background: $err-soft;
-    border: round $err-soft;
     color: $text-dim;
 }
 
-TaskCard.-ctx-critical {
-    background: $err-soft;
-    border: round $err-soft;
-}
-
-/* Selection: keep status tint, add a thick accent rail on the left.
-   Reserves padding above so cards don't shift when the rail appears. */
+/* Selection: lift the surface — no border, no layout shift. */
 TaskCard.-selected {
-    border-left: thick $accent;
+    background: $surface-hi;
 }
 
 /* --- Task input dialog --- */
@@ -387,9 +357,10 @@ AgentPanelView .agent-status {
 AgentPanelView .agent-help {
     dock: bottom;
     height: 1;
-    color: $text-faint;
+    color: $text-dim;
     background: $bg-elevated;
     padding: 0 1;
+    border-top: hkey $border;
 }
 
 AgentPanelView .agent-input {

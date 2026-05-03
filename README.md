@@ -1,8 +1,8 @@
 # LLM Command Center
 
-A terminal UI that orchestrates AI coding agents through configurable pipelines. Kanban board with vim keybindings, native PTY agent management, file-based context flow between stages.
+A terminal UI that orchestrates AI coding agents through configurable pipelines. Kanban board with vim keybindings, tmux-hosted agent sessions, file-based context flow between stages.
 
-No frameworks beyond Textual (TUI), pexpect (PTY), pyte (terminal emulation), Pydantic (models).
+Built on Textual (TUI), tmux (PTY/session host), Rich (ANSI rendering), Pydantic (models). Python 3.12+, macOS only (tmux, fcntl locking).
 
 ```
 llm-cc /path/to/project
@@ -12,7 +12,7 @@ llm-cc /path/to/project
 
 ## How It Works
 
-Tasks flow through a kanban board. Each stage spawns an agent (Claude, Codex, etc.) in a pseudo-terminal. All transitions are manual — you decide when to advance, revert, or restart.
+Tasks flow through a kanban board. Each stage spawns an agent (Claude, Codex, etc.) in a detached tmux session (`llmcc_<task>_<stage>`). All transitions are manual by default — you decide when to advance, revert, or restart. Stages can opt into auto-advance with `auto = true`.
 
 Stages are **optional** — only stages with `[[pipeline]]` entries appear as columns. BACKLOG and DONE are always present.
 
@@ -52,7 +52,7 @@ The board polls active agents every 2s and detects two distinct states:
 
 2. **WAITING FOR INPUT** (yellow) — agent is idle at a permission prompt, needs approval, or is asking a question. Not the same as stage complete.
 
-Both use the same detection mechanism: screen stability (3+ poll ticks with no change) + pattern matching on the full pyte screen buffer. Stage complete takes priority — if a completion marker is present, it shows orange even if input patterns also match.
+Both use the same detection mechanism: screen stability (3+ poll ticks with no change) + pattern matching on the full captured viewport (via `tmux capture-pane`). Stage complete takes priority — if a completion marker is present, it shows orange even if input patterns also match.
 
 Both states trigger a **desktop notification** (Textual toast + terminal bell) when detected, so you don't need to watch the board. Stage complete shows as a warning-severity notification.
 
@@ -70,11 +70,11 @@ _INPUT_PATTERNS = (
 )
 ```
 
-**Important: searches full screen, not bottom N lines.** CLI tools use cursor positioning escape codes (ANSI CSI sequences) that can render prompts anywhere on the virtual terminal. The pyte `Screen.display` returns the full 40-row buffer — we search all of it.
+**Important: searches full screen, not bottom N lines.** CLI tools use cursor positioning escape codes (ANSI CSI sequences) that can render prompts anywhere on the virtual terminal. The captured `tmux capture-pane` snapshot covers the whole viewport — we search all of it.
 
 ### Health Monitoring
 
-Each PTY agent session gets a composite health score (0-100) computed from four components:
+Each agent session gets a composite health score (0-100) computed from four components:
 
 | Component | Range | What it measures |
 |-----------|-------|-----------------|
@@ -150,29 +150,36 @@ Implementation: parked sessions are stored in `PipelineEngine._brainstorm_sessio
 
 | Key | Action |
 |-----|--------|
-| `h` `l` | Move between columns |
-| `j` `k` | Move between tasks |
+| `← →` | Move between columns |
+| `↑ ↓` | Move between tasks |
 | `m` | Advance task to next stage |
 | `b` | Move task back one stage |
 | `r` | Restart current stage agent |
 | `o` | Create new task |
 | `e` | Edit task |
-| `Enter` | Open agent panel (live output + input) |
+| `Enter` | Open agent tab for selected task |
+| `Ctrl+O` | Back to overview tab |
+| `Ctrl+← / Ctrl+→` | Cycle agent tabs |
 | `s` | Stop agent |
 | `d` | Show git diff |
 | `x` | Delete task |
+| `?` | Show help |
 | `q` | Quit |
 
-### Agent Panel
+### Agent Tabs
 
-`Enter` opens a fullscreen modal showing the agent's live PTY output with ANSI colors preserved. The panel uses pyte's `HistoryScreen` for scrollback (5000 lines) and renders styled Rich `Text` objects. The PTY is dynamically resized to match the panel dimensions.
+`Enter` opens an embedded tab next to "Overview" showing the agent's live tmux output. Output is captured via `tmux capture-pane -p -e` (ANSI preserved) and rendered through `rich.text.Text.from_ansi`; the buffer keeps a 5000-line ANSI history for scrollback.
 
-Keys are forwarded directly to the agent:
+By default, agent tabs are only opened on demand — set `[project] auto_open_agent_tabs = true` to auto-open a tab for every active session.
 
-- All printable characters, Enter, Tab, arrows → sent to PTY
-- `Esc` → close panel
+Keys are forwarded directly to the agent's tmux session:
+
+- All printable characters, Enter, Tab, arrows → sent to tmux
+- `Esc` → switch back to Overview tab (session keeps running)
 - `Ctrl+C` → send interrupt to agent
 - `Ctrl+T` → toggle text input mode (for longer prompts)
+- `Ctrl+V` → paste clipboard
+- `Ctrl+Y` → copy recent output to clipboard
 - `Shift+PageUp/PageDown` → scroll output history
 - `Shift+Home/End` → jump to top / resume auto-scroll
 - Mouse wheel → scroll (auto-scroll resumes when you reach the bottom)
@@ -333,7 +340,7 @@ When `model` is set, it's auto-injected as `--model {model}` into the command un
 
 ### Agent modes
 
-- **PTY** (default) — spawns CLI in a pseudo-terminal via pexpect. Interactive — supports live output viewing, key forwarding, input detection.
+- **Tmux** (default, `mode = "pty"` in config) — spawns CLI in a detached tmux session (`llmcc_<task>_<stage>`). Interactive — supports live output viewing via `tmux capture-pane`, key forwarding via `tmux send-keys`, and input/completion detection by scanning the captured viewport.
 - **API** — calls Anthropic/OpenAI SDK directly. Non-interactive, runs as background asyncio task. Optional deps: `pip install llm-command-center[anthropic]` or `[all]`.
 
 ---
@@ -343,10 +350,10 @@ When `model` is set, it's auto-injected as `--model {model}` into the command un
 ```
 ┌─────────────────────────────────────────────────────┐
 │                    TUI Layer (Textual)               │
-│  ┌──────────┐ ┌──────────┐ ┌───────────────────┐   │
-│  │Dashboard │ │  Board   │ │  Agent Output     │   │
-│  │ Screen   │ │  Screen  │ │  Panel            │   │
-│  └──────────┘ └──────────┘ └───────────────────┘   │
+│  ┌──────────────────────┐ ┌─────────────────────┐  │
+│  │  Board Screen        │ │  Agent Tabs         │  │
+│  │  (kanban + tabs)     │ │  (live tmux view)   │  │
+│  └──────────────────────┘ └─────────────────────┘  │
 ├─────────────────────────────────────────────────────┤
 │              Orchestration Layer                      │
 │  ┌──────────┐ ┌──────────┐ ┌───────────────────┐   │
@@ -355,10 +362,10 @@ When `model` is set, it's auto-injected as `--model {model}` into the command un
 │  └──────────┘ └──────────┘ └───────────────────┘   │
 ├─────────────────────────────────────────────────────┤
 │                Backend Layer (Async)                  │
-│  ┌──────────┐ ┌──────────┐ ┌───────────────────┐   │
-│  │PTY Agent │ │API Agent │ │  JSON Storage     │   │
-│  │ Backend  │ │ Backend  │ │  + Config         │   │
-│  └──────────┘ └──────────┘ └───────────────────┘   │
+│  ┌───────────┐ ┌──────────┐ ┌──────────────────┐   │
+│  │Tmux Agent │ │API Agent │ │  JSON Storage    │   │
+│  │ Backend   │ │ Backend  │ │  + Config        │   │
+│  └───────────┘ └──────────┘ └──────────────────┘   │
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -369,14 +376,15 @@ src/llm_cc/
 ├── models.py       # Pydantic models: Task, Config, Pipeline, Agent
 ├── storage.py      # JSON store (fcntl locking) + TOML config
 ├── pipeline.py     # Stage transitions, agent lifecycle, file-based context
-├── agents.py       # PTY/API backends, output buffer, input detection
+├── agents.py       # Tmux/API backends, OutputBuffer, input/complete detection
+├── health.py       # Error patterns, context monitoring, health scoring
 ├── git.py          # Worktree/branch ops, diff, PR creation
+├── permissions.py  # Default allowed_tools per agent
 ├── app.py          # Textual App, session cleanup
-├── utils.py        # async_run, process management
+├── utils.py        # async helpers
 └── ui/
-    ├── board.py    # Kanban board screen
-    ├── dashboard.py # Project selector
-    ├── panels.py   # Agent panel, diff view, dialogs
+    ├── board.py    # Kanban board screen + agent tabs
+    ├── panels.py   # Agent panel view, diff view, dialogs, help
     └── styles.tcss # Dark theme CSS
 ```
 
@@ -439,8 +447,8 @@ When finished, say: PLANNING COMPLETE
 The bottleneck is AI agent response time (seconds to minutes), not rendering speed. Python's advantages:
 
 - **Textual** — best-in-class TUI framework (CSS theming, reactive state, component model)
-- **pexpect** — mature PTY management with pattern matching and async support
-- **pyte** — proper VT100 terminal emulator for decoding agent output
+- **tmux** — battle-tested PTY/session host; survives the app crashing, attachable from any other terminal
+- **Rich** — robust ANSI text rendering for the captured viewport
 - **Pydantic** — type-safe models with validation and JSON serialization
 - **asyncio** — all work is I/O-bound (waiting for AI, git, file I/O). GIL is irrelevant.
 - **AI SDKs** — Anthropic and OpenAI SDKs are Python-first
@@ -450,22 +458,17 @@ Tradeoffs accepted: ~80ms startup (app launches once, stays open), ~40MB memory 
 ### Why asyncio (not threads)
 
 Every operation is I/O-bound:
-- AI agents: seconds to minutes (PTY reads, API calls)
+- AI agents: seconds to minutes (tmux capture-pane polls, API calls)
 - Git ops: subprocess, <1s
 - File I/O: <1ms
 
 asyncio handles all concurrently on one thread. No GIL issues, no thread sync, no deadlocks. Textual's `@work` decorator integrates natively with asyncio.
 
-### Why pyte (not regex ANSI stripping)
+### Why tmux (not in-process pexpect/pyte)
 
-CLI agents output complex VT100 escape sequences — cursor positioning, screen clearing, color codes, alternate screen buffers. Regex stripping (`\x1b\[[0-9;]*m`) fails on:
+CLI agents output complex VT100 escape sequences — cursor positioning, screen clearing, color codes, alternate screen buffers. Earlier versions ran the agent inside `pexpect` and emulated the terminal in-process via `pyte`. Two problems killed it: (1) maintaining a faithful VT100 emulator is a project of its own, and (2) if the app crashed, the agent died with it.
 
-- Cursor movement (`\x1b[H`, `\x1b[2J`)
-- Scrolling regions
-- Tab stops
-- Multi-byte sequences
-
-pyte is a full terminal emulator. Feed it raw PTY output, get a character grid back. `OutputBuffer` uses `pyte.HistoryScreen` (with 5000-line scrollback) for both display rendering and input pattern detection. The `display_rich()` method walks pyte's per-character style attributes (fg, bg, bold, italic, underscore) and reconstructs Rich `Text` objects with proper colors — including named colors, 256-color, and truecolor. The PTY and pyte buffer are dynamically sized to match the actual terminal dimensions.
+We delegate both jobs to tmux. Agents run in detached tmux sessions (`llmcc_<task>_<stage>`) — tmux owns the PTY and renders the viewport correctly. The app polls `tmux capture-pane -p -e` for an ANSI snapshot, feeds it through `rich.text.Text.from_ansi`, and keeps a 5000-line ANSI history for scrollback. Activity is tracked by tailing a `pipe-pane` log. Crashes leave sessions running; reattach with `tmux a -t llmcc_*`.
 
 ### Why flat JSON (not SQLite)
 
@@ -621,16 +624,16 @@ class AgentBackend(Protocol):
     def is_alive(session_id) -> bool
 ```
 
-### PTY Backend
+### Tmux Backend
 
-Spawns CLI agents in native pseudo-terminals via pexpect:
+Spawns CLI agents in detached tmux sessions:
 
 1. **Command construction**: `{command} --model {model} {cli_flags} {args_template.format(prompt=quoted_prompt)}` — model flag auto-injected when `model` is set and `{model}` not in `args_template`
-2. **Output polling**: background asyncio.Task reads PTY at 0.1s intervals, feeds data into pyte `OutputBuffer` (uses `HistoryScreen` with 5000-line scrollback and Rich text rendering)
-3. **DSR response**: responds to cursor position queries (`\x1b[6n`) that some CLIs (e.g., Codex) use for terminal size detection
-4. **Disk logging**: all PTY output written to `.llm-cc/logs/{session_id}.log`
-5. **Session IDs**: `pty_{task_id}_{stage}` — e.g. `pty_a1b2c3d4_planning`
-6. **Orphan prevention**: `start()` stops old session if same ID exists; `_ProcessManager` singleton registered with `atexit` kills all children on crash
+2. **Session start**: `tmux new-session -d -s llmcc_{task}_{stage}` then `send-keys` the assembled command
+3. **Output polling**: app polls `tmux capture-pane -p -e -S -5000 -t <session>` for an ANSI snapshot; the result is fed through `rich.text.Text.from_ansi` and stored in `OutputBuffer` (plain text + ANSI viewport + 5000-line ANSI history)
+4. **Activity tracking**: `tmux pipe-pane` writes raw output to `.llm-cc/logs/{session_id}.log`; tail position drives the activity score
+5. **Session IDs**: `llmcc_{task_id}_{stage}` — e.g. `llmcc_a1b2c3d4_planning`
+6. **Survives crashes**: tmux owns the PTY, so the agent keeps running if the TUI dies. Reattach via `tmux a -t llmcc_*` or relaunch `llm-cc` (the app rebinds to existing sessions on startup)
 
 ### API Backend
 
@@ -724,11 +727,17 @@ Column headers show: stage name, agent name, model name, and task count. Agent a
 
 ### Task card indicators
 
-| Indicator | Condition | Meaning |
-|-----------|-----------|---------|
-| `[bold red]STALE[/]` | Active stage + no session_id | Agent died, needs restart (`r`) |
-| `[bold yellow]WAITING FOR INPUT[/]` | `OutputBuffer.appears_waiting` is True | Agent idle — permission prompt, completion, or needs input |
-| `[agent_name]` | Has session_id, not waiting | Agent running normally |
+Each card shows a single status chip (priority: Error > Needs restart > Ready > Waiting > Running):
+
+| Chip | Condition | Meaning |
+|------|-----------|---------|
+| `Error: <pattern>` (red) | Recent error matched | Detected by `health.py` pattern scan |
+| `Needs restart` (red) | Active stage + no `session_id` | Agent died, restart with `r` |
+| `Ready` (orange) | Completion marker matched | Agent reported `STAGE COMPLETE` — advance with `m` |
+| `Waiting` (yellow) | Input prompt matched | Agent idle on prompt — open with `Enter` |
+| `Running` (green) | Live session, no other state | Agent working normally |
+
+Cards also show: short description, brainstorm cycle (when applicable), resolved agent name, health score, context-remaining bar, and total tokens.
 
 ### Async workers
 
@@ -751,7 +760,7 @@ On app startup, `_cleanup_stale_sessions()` scans all tasks in PLANNING/EXECUTE/
 Separate lock file (`tasks.lock`). Lock acquired before any read or write. Atomic write via temp file + `os.replace()`. `save_task()` holds single lock across read-modify-write.
 
 ### Session orphaning
-`PtyBackend.start()` stops old session if same ID exists before spawning. `_ProcessManager` singleton registered with `atexit` kills all PTY children on crash.
+`TmuxBackend.start()` kills any pre-existing session with the same name before spawning. Sessions outlive the TUI by design (tmux owns the PTY); `--clean-exit` mode kills sessions on app exit if you'd rather not leave anything running.
 
 ### Stale task objects in async workers
 All `@work` methods accept `task_id: str`, not `Task` object. Workers re-read from storage before mutating. Confirmation dialog closures capture `task_id` (stable), not task object (may be stale).

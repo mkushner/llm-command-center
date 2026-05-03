@@ -169,6 +169,7 @@ class HelpScreen(ModalScreen[None]):
             ("ctrl+o", "back to overview"),
             ("ctrl+→", "next agent tab"),
             ("ctrl+←", "previous agent tab"),
+            ("ctrl+w", "close active agent tab (agent keeps running)"),
         )),
         ("Inside an Agent Tab", (
             ("ctrl+c", "interrupt agent"),
@@ -316,8 +317,9 @@ class AgentPanelView(Container):
     @staticmethod
     def _default_help() -> str:
         return (
-            "[b]Esc[/] back  ·  [b]Ctrl+C[/] interrupt  ·  "
-            "[b]Ctrl+T[/] type  ·  [b]Ctrl+V[/] paste  ·  "
+            "[b #f87171]Ctrl+C[/] [#f87171]interrupt[/]  ·  "
+            "[b]Ctrl+T[/] type  ·  [b]Esc[/] back  ·  "
+            "[b]Ctrl+W[/] close tab  ·  [b]Ctrl+V[/] paste  ·  "
             "[b]Ctrl+Y[/] copy  ·  [b]Shift+PgUp/Dn[/] scroll"
         )
 
