@@ -84,17 +84,19 @@ class CommandCenterApp(App):
         timeout: float | None = None,
         markup: bool = True,
     ) -> None:
-        key = f"{severity}:{message}"
-        now = time.monotonic()
-        last = self._recent_notifies.get(key)
-        if last is not None and now - last < 1.5:
-            return
-        self._recent_notifies[key] = now
-        if len(self._recent_notifies) > 64:
-            cutoff = now - 5.0
-            self._recent_notifies = {
-                k: t for k, t in self._recent_notifies.items() if t >= cutoff
-            }
+        # Errors bypass dedupe — the user must see every failure.
+        if severity != "error":
+            key = f"{severity}:{timeout}:{message}"
+            now = time.monotonic()
+            last = self._recent_notifies.get(key)
+            if last is not None and now - last < 1.5:
+                return
+            self._recent_notifies[key] = now
+            if len(self._recent_notifies) > 64:
+                cutoff = now - 5.0
+                self._recent_notifies = {
+                    k: t for k, t in self._recent_notifies.items() if t >= cutoff
+                }
         super().notify(
             message,
             title=title,

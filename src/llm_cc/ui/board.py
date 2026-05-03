@@ -159,11 +159,12 @@ class KanbanColumn(VerticalScroll, can_focus=False):
                 f"[dim]{' · '.join(meta_parts)}[/]",
                 classes="column-meta",
             )
-        yield Static(
-            self._empty_text(),
-            classes="column-empty",
-            id=f"empty-{self.status.value}",
-        )
+        if self.status in (TaskStatus.BACKLOG, TaskStatus.DONE):
+            yield Static(
+                self._empty_text(),
+                classes="column-empty",
+                id=f"empty-{self.status.value}",
+            )
 
     def _header_text(self, count: int) -> str:
         return f"[b]{self.label.upper()}[/]   [dim]{count}[/]"
@@ -171,9 +172,7 @@ class KanbanColumn(VerticalScroll, can_focus=False):
     def _empty_text(self) -> str:
         if self.status == TaskStatus.BACKLOG:
             return "[dim]no tasks yet[/]\n[dim]press [b]o[/] to add[/]"
-        if self.status == TaskStatus.DONE:
-            return "[dim]nothing shipped yet[/]"
-        return "[dim]—[/]"
+        return "[dim]nothing shipped yet[/]"
 
     @property
     def selected_index(self) -> int:
@@ -197,8 +196,12 @@ class KanbanColumn(VerticalScroll, can_focus=False):
     def task_count(self) -> int:
         return len(self._tasks)
 
-    def set_tasks(self, tasks: list[Task]) -> None:
-        """Replace all task cards in this column."""
+    def set_tasks(self, tasks: list[Task], *, show_empty: bool = True) -> None:
+        """Replace all task cards in this column.
+
+        `show_empty=False` hides per-column placeholders (e.g., when the
+        first-launch overlay is already covering empty state).
+        """
         self._tasks = tasks
         for card in self.query(TaskCard):
             card.remove()
@@ -211,11 +214,12 @@ class KanbanColumn(VerticalScroll, can_focus=False):
             self._selected = min(self._selected, len(self._tasks) - 1)
         else:
             self._selected = 0
-        try:
-            empty = self.query_one(f"#empty-{self.status.value}", Static)
-            empty.display = not bool(self._tasks)
-        except Exception:
-            pass
+        if self.status in (TaskStatus.BACKLOG, TaskStatus.DONE):
+            try:
+                empty = self.query_one(f"#empty-{self.status.value}", Static)
+                empty.display = show_empty and not bool(self._tasks)
+            except Exception:
+                pass
         self._update_selection()
 
     def _update_selection(self) -> None:
@@ -521,11 +525,14 @@ class BoardScreen(Screen):
 
     def _refresh_board(self) -> None:
         store = self.storage.load_tasks()
+        is_empty = len(store.tasks) == 0
         for col in self._columns:
-            col.set_tasks(store.by_status(col.status))
+            # When the first-launch banner is showing, the per-column
+            # "no tasks yet" hints would be redundant — hide them.
+            col.set_tasks(store.by_status(col.status), show_empty=not is_empty)
         try:
             overlay = self.query_one("#first-launch", Static)
-            overlay.display = len(store.tasks) == 0
+            overlay.display = is_empty
         except Exception:
             pass
         self._update_column_focus()

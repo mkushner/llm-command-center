@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 from textual import on
 from textual.app import ComposeResult
@@ -298,6 +299,8 @@ class AgentPanelView(Container):
         self._polling = True
         self._input_mode = False
         self._follow_tail = True
+        self._glyph_cache: str = ""
+        self._glyph_at: float = 0.0
 
     def _titlebar_text(self) -> str:
         parts: list[str] = []
@@ -333,17 +336,19 @@ class AgentPanelView(Container):
             Static("Loading...", classes="agent-output"),
             classes="agent-scroll",
         )
-        # Bottom strip: pause chip → input (hidden) → status → help (top-to-bottom)
-        yield Static(
-            "[b]PAUSED[/] · [dim]Shift+End to resume tail[/]",
-            classes="agent-pause",
-        )
+        # Bottom strip — Textual stacks dock:bottom siblings with the
+        # first-composed widget closest to the bottom edge. Compose in
+        # reverse so the visual order (top→bottom) is: pause, input, status, help.
+        yield Static(self._default_help(), classes="agent-help")
+        yield Static("[dim]waiting for agent…[/]", classes="agent-status")
         yield Input(
             placeholder="Type, Enter to send · Esc to exit input mode",
             classes="agent-input",
         )
-        yield Static("[dim]waiting for agent…[/]", classes="agent-status")
-        yield Static(self._default_help(), classes="agent-help")
+        yield Static(
+            "[b]PAUSED[/] · [dim]Shift+End to resume tail[/]",
+            classes="agent-pause",
+        )
 
     def on_mount(self) -> None:
         inp = self.query_one(".agent-input", Input)
@@ -487,31 +492,43 @@ class AgentPanelView(Container):
             pass
 
     def _heartbeat_glyph(self) -> str:
-        """Health-driven glyph: ● healthy, ◐ degraded, ▪ idle, ✕ dead."""
+        """Health-driven glyph: ● healthy, ◐ degraded, ▪ idle, ✕ dead.
+
+        Cached for ~1s — `is_alive` calls fork tmux, so calling every
+        poll tick (5Hz) would mean 5+ subprocesses/sec per open agent tab.
+        """
+        now = time.monotonic()
+        if now - self._glyph_at < 1.0:
+            return self._glyph_cache
         backend = self._backend
         if not hasattr(backend, "is_alive"):
-            return ""
+            self._glyph_cache = ""
+            self._glyph_at = now
+            return self._glyph_cache
         try:
             alive = backend.is_alive(self._session_id)
         except Exception:
             alive = False
         if not alive:
-            return "[#f87171]✕[/]"
-        score: int | None = None
-        if hasattr(backend, "health"):
-            try:
-                h = backend.health(self._session_id)
-                if h is not None:
-                    score = h.score
-            except Exception:
-                pass
-        if score is None:
-            return "[#4ade80]●[/]"
-        if score >= 75:
-            return "[#4ade80]●[/]"
-        if score >= 50:
-            return "[#fbbf24]◐[/]"
-        return "[#fb923c]▪[/]"
+            glyph = "[#f87171]✕[/]"
+        else:
+            score: int | None = None
+            if hasattr(backend, "health"):
+                try:
+                    h = backend.health(self._session_id)
+                    if h is not None:
+                        score = h.score
+                except Exception:
+                    pass
+            if score is None or score >= 75:
+                glyph = "[#4ade80]●[/]"
+            elif score >= 50:
+                glyph = "[#fbbf24]◐[/]"
+            else:
+                glyph = "[#fb923c]▪[/]"
+        self._glyph_cache = glyph
+        self._glyph_at = now
+        return glyph
 
     def _format_status_bar(self, status_data: dict) -> str:
         parts: list[str] = []
