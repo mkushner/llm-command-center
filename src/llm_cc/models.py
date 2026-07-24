@@ -94,6 +94,7 @@ class AgentConfig(BaseModel):
     command: str | None = None
     args_template: str = "{prompt}"
     model: str | None = None          # model name for display + {model} in args_template
+    effort: str | None = None         # reasoning effort for display (e.g. "xhigh")
     mode: AgentMode = AgentMode.PTY
     api_provider: str | None = None
     api_model: str | None = None

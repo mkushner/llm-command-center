@@ -253,6 +253,47 @@ def test_codex_full_auto_injected_in_command():
     assert "--full-auto" in full_cmd
 
 
+def test_project_agent_override_inherits_default_allowed_tools(tmp_path):
+    """Redefining [agents.claude] to pin a model must not drop the default
+    read-only allowed_tools — otherwise every Read/Grep prompts for approval."""
+    from llm_cc.storage import Storage, _default_agents
+
+    (tmp_path / ".llm-cc").mkdir()
+    (tmp_path / ".llm-cc" / "config.toml").write_text(
+        '[agents.claude]\ncommand = "claude"\nmodel = "claude-opus-5"\n'
+    )
+    claude = Storage(tmp_path).load_config().agents["claude"]
+    assert claude.model == "claude-opus-5"  # override applied
+    assert claude.allowed_tools == _default_agents()["claude"].allowed_tools  # defaults kept
+    assert claude.co_author == "Claude <noreply@anthropic.com>"  # other fields too
+
+
+def test_project_agent_allowed_tools_extend_defaults(tmp_path):
+    from llm_cc.storage import Storage, _default_agents
+
+    (tmp_path / ".llm-cc").mkdir()
+    (tmp_path / ".llm-cc" / "config.toml").write_text(
+        '[agents.claude]\nallowed_tools = ["Read", "Bash(npm test:*)"]\n'
+    )
+    tools = Storage(tmp_path).load_config().agents["claude"].allowed_tools
+    assert "Bash(npm test:*)" in tools  # extra tool added
+    assert set(_default_agents()["claude"].allowed_tools) <= set(tools)  # defaults kept
+    assert tools.count("Read") == 1  # deduplicated
+
+
+def test_new_project_agent_name_gets_no_inherited_tools(tmp_path):
+    """A fresh agent name has no built-in to inherit from — stays as written."""
+    from llm_cc.storage import Storage
+
+    (tmp_path / ".llm-cc").mkdir()
+    (tmp_path / ".llm-cc" / "config.toml").write_text(
+        '[agents.my_claude]\ncommand = "claude"\nallowed_tools = ["Read"]\n'
+    )
+    agents = Storage(tmp_path).load_config().agents
+    assert agents["my_claude"].allowed_tools == ["Read"]
+    assert "claude" in agents  # built-ins still present alongside
+
+
 def test_codex_full_auto_not_injected_if_user_set_approval():
     from llm_cc.models import AgentConfig
 

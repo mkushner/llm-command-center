@@ -749,7 +749,7 @@ class ApiBackend:
 
         client = anthropic.AsyncAnthropic()
         msg = await client.messages.create(
-            model=config.api_model or config.model or "claude-sonnet-4-6",
+            model=config.api_model or config.model or "claude-opus-5",
             max_tokens=4096,
             messages=[{"role": "user", "content": prompt}],
         )

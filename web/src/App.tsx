@@ -109,11 +109,6 @@ export default function App() {
     setDiff({ title: task.title, text: (r && r.diff) || "" });
   };
 
-  const sendReply = async (id: string, text: string) => {
-    const r = await post(`/api/task/${id}/input`, { text });
-    if (r && r.error) window.alert(r.error);
-  };
-
   // Global shortcuts (kept off the terminal / inputs where relevant).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -168,7 +163,7 @@ export default function App() {
           )}
           {mode === "grid" && <Grid live={live} onPick={drillTo} />}
           {mode === "focus" && activeFocusTask && (
-            <Focus task={activeFocusTask} onAction={runAction} onDiff={openDiff} onReply={sendReply} />
+            <Focus task={activeFocusTask} onAction={runAction} onDiff={openDiff} />
           )}
         </div>
       </div>

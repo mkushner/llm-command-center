@@ -208,9 +208,9 @@ branch_prefix = "task/"   # prefix for branch names; "" for flat naming
 # Define agents
 [agents.claude_opus]
 command = "claude"
-model = "claude-opus-4-6"                # shown in column header + auto-injected as --model flag
+model = "claude-opus-5"                  # shown in column header + auto-injected as --model flag
 mode = "pty"
-# allowed_tools inherited from defaults (read-only ops auto-approved)
+# new agent name → no inherited allowed_tools; reuse [agents.claude] to keep the defaults
 
 [agents.claude_sonnet]
 command = "claude"
@@ -316,12 +316,26 @@ Two agents are registered by default (override in config):
 - **claude** — `claude {prompt}` — ships with `--allowedTools` for read-only operations (Read, Glob, Grep, LS, git status, gh queries, etc.) so the agent doesn't prompt for every file read
 - **codex** — `codex "{prompt}"`
 
-The `allowed_tools` field on `AgentConfig` controls which tool patterns are auto-approved via the Claude CLI `--allowedTools` flag. The default list covers read-only operations only — no writes, edits, or destructive commands. Override per-agent in config:
+The `allowed_tools` field on `AgentConfig` controls which tool patterns are auto-approved via the Claude CLI `--allowedTools` flag. The default list covers read-only operations only — no writes, edits, or destructive commands.
+
+Reusing a built-in name (`[agents.claude]`) **layers over** the built-in rather than replacing it: keys you set win, keys you omit are inherited. So pinning a model keeps the default `allowed_tools`, `co_author`, and everything else. `allowed_tools` is the exception to "set wins" — it accumulates, same as per-stage `allowed_tools` extends the agent's:
+
+```toml
+[agents.claude]
+model = "claude-opus-5"                   # keeps the default read-only allowed_tools
+```
+
+```toml
+[agents.claude]
+allowed_tools = ["Bash(npm test:*)"]      # defaults + npm test
+```
+
+To start from an empty tool list instead, use a new agent name — it has no built-in to inherit from:
 
 ```toml
 [agents.my_claude]
 command = "claude"
-allowed_tools = ["Read", "Glob", "Grep"]  # restrict to fewer tools
+allowed_tools = ["Read", "Glob", "Grep"]  # exactly these three
 ```
 
 An "agent" is a named config, not a product. The same CLI with different models = different agent configs:

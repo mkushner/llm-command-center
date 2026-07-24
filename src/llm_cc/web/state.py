@@ -16,6 +16,13 @@ ACTIVE_STAGES = {TaskStatus.PLANNING, TaskStatus.EXECUTE, TaskStatus.REVIEW}
 _PREVIEW_LINES = 40
 
 
+def _model_label(ac: Any) -> str:
+    """Model name with effort appended, e.g. 'claude-opus-4-8 / xhigh'."""
+    if ac.model and getattr(ac, "effort", None):
+        return f"{ac.model} / {ac.effort}"
+    return ac.model or ""
+
+
 async def build_state(app_state: Any) -> dict[str, Any]:
     storage = app_state.storage
     registry = app_state.registry
@@ -47,7 +54,7 @@ async def build_state(app_state: Any) -> dict[str, Any]:
         try:
             ac = config.agent_for_stage(status)
             entry["agent"] = ac.name
-            entry["model"] = ac.model or ""
+            entry["model"] = _model_label(ac)
         except Exception:
             pass
         stages.append(entry)
@@ -68,7 +75,7 @@ async def _task_dto(task: Any, registry: Any, config: Any) -> dict[str, Any]:
     try:
         ac = config.agent_for_stage(task.status, task)
         agent = ac.name
-        model = ac.model or ""
+        model = _model_label(ac)
     except Exception:
         pass
 

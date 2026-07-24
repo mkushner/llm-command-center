@@ -130,20 +130,6 @@ button { font-family: inherit; }
 .terminal-host { flex: 1; min-height: 0; padding: 8px 10px 4px; background: linear-gradient(180deg, #090c11, #0a0d12); overflow: hidden; }
 .terminal-host .xterm { height: 100%; }
 
-/* ---- reply row (send a line to the agent) ---- */
-.reply {
-  flex: none; display: flex; align-items: center; gap: 10px; margin: 0 12px 10px;
-  padding: 9px 12px; border: 1px solid var(--border-strong); border-radius: 9px;
-  background: var(--elevated);
-}
-.reply.hot { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent-soft); }
-.reply .rp { color: var(--accent); font-family: var(--mono); }
-.reply input {
-  flex: 1; min-width: 0; background: transparent; border: none; outline: none;
-  color: var(--text); font-family: var(--mono); font-size: 12.5px;
-}
-.reply input::placeholder { color: var(--faint); }
-
 /* ---- status bar ---- */
 .statusbar {
   flex: none; display: flex; align-items: center; gap: 14px; height: 30px; padding: 0 16px;

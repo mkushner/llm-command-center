@@ -137,7 +137,7 @@ class Storage:
     def load_config(self) -> MergedConfig:
         global_cfg = self._load_global_config()
         project_cfg = self._load_project_config()
-        agents = {**_default_agents(), **project_cfg.agents}
+        agents = _merge_agents(_default_agents(), project_cfg.agents)
         pipeline = project_cfg.pipeline or _default_pipeline()
         return MergedConfig(
             project=project_cfg,
@@ -220,6 +220,8 @@ def _default_agents() -> dict[str, AgentConfig]:
             name="claude",
             command="claude",
             args_template="{prompt}",
+            model="claude-opus-5",
+            effort="xhigh",
             co_author="Claude <noreply@anthropic.com>",
             allowed_tools=_DEFAULT_CLAUDE_ALLOWED_TOOLS,
         ),
@@ -231,6 +233,29 @@ def _default_agents() -> dict[str, AgentConfig]:
             auto_full_auto=True,
         ),
     }
+
+
+def _merge_agents(
+    defaults: dict[str, AgentConfig], overrides: dict[str, AgentConfig]
+) -> dict[str, AgentConfig]:
+    """Layer project [agents.<name>] blocks over the built-in defaults, field by field.
+
+    Only keys the project actually set are overridden — the rest are inherited, so
+    redefining [agents.claude] just to pin a model keeps the default allowed_tools
+    instead of silently dropping them. allowed_tools accumulates rather than
+    replaces, matching how per-stage allowed_tools extends the agent's.
+    """
+    merged = dict(defaults)
+    for name, override in overrides.items():
+        base = merged.get(name)
+        if base is None:
+            merged[name] = override
+            continue
+        data = base.model_dump()
+        data.update({f: getattr(override, f) for f in override.model_fields_set})
+        data["allowed_tools"] = list(dict.fromkeys(base.allowed_tools + override.allowed_tools))
+        merged[name] = AgentConfig.model_validate(data)
+    return merged
 
 
 def _default_pipeline() -> list[PipelineStage]:

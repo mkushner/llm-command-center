@@ -1,4 +1,3 @@
-import { type FormEvent, useState } from "react";
 import { colorVar, fmtTokens, statusMeta } from "../helpers";
 import type { TaskDTO } from "../types";
 import { Terminal } from "./Terminal";
@@ -7,22 +6,12 @@ interface Props {
   task: TaskDTO;
   onAction: (id: string, action: string) => void;
   onDiff: (task: TaskDTO) => void;
-  onReply: (id: string, text: string) => void;
 }
 
-export function Focus({ task, onAction, onDiff, onReply }: Props) {
+export function Focus({ task, onAction, onDiff }: Props) {
   const m = statusMeta(task.status_kind);
   const hb = colorVar(task.health_color);
   const cc = colorVar(task.context_color);
-  const [reply, setReply] = useState("");
-
-  const submit = (e: FormEvent) => {
-    e.preventDefault();
-    const text = reply.trim();
-    if (!text) return;
-    onReply(task.id, text);
-    setReply("");
-  };
 
   return (
     <div className="stage">
@@ -55,17 +44,6 @@ export function Focus({ task, onAction, onDiff, onReply }: Props) {
 
       <Terminal sessionId={task.session_id!} key={task.session_id!} />
 
-      <form className={`reply ${task.attention ? "hot" : ""}`} onSubmit={submit}>
-        <span className="rp">›</span>
-        <input
-          value={reply}
-          onChange={(e) => setReply(e.target.value)}
-          placeholder={
-            task.attention ? "the agent is waiting — type your reply…" : "send a message to the agent…"
-          }
-        />
-      </form>
-
       <div className="statusbar">
         <span className="hb" style={{ color: hb }}>
           ●
@@ -81,7 +59,7 @@ export function Focus({ task, onAction, onDiff, onReply }: Props) {
         <span>
           {task.agent} {task.model}
         </span>
-        <span className="hint">type to reply · Ctrl+C interrupt · ⌘G grid</span>
+        <span className="hint">type in the terminal to reply · Ctrl+C interrupt · ⌘G grid</span>
       </div>
     </div>
   );
