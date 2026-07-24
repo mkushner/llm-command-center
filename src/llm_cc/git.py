@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import shutil
+import subprocess
 from pathlib import Path
 
 from .models import GitConfig, GitMode, Task
@@ -30,9 +31,11 @@ class GitWorkspace:
         return (self.project_path / ".git").exists()
 
     def _auto_detect_base_branch(self) -> None:
-        """Detect the default branch (main, master, etc.) from the repo."""
-        import subprocess
+        """Detect the default branch (main, master, etc.) from the repo.
 
+        Blocking on purpose: this runs once during construction, before any
+        event loop exists.
+        """
         # Try 1: origin/HEAD (set by git clone or git remote set-head)
         try:
             result = subprocess.run(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import shlex
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,7 +40,6 @@ async def async_run(
         )
     else:
         if isinstance(cmd, str):
-            import shlex
             cmd = shlex.split(cmd)
         proc = await asyncio.create_subprocess_exec(
             *cmd,

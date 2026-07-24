@@ -1,6 +1,7 @@
 """Tests for OutputBuffer.appears_waiting — the input-detection heuristic."""
 
-from llm_cc.agents import OutputBuffer
+from llm_cc.agents import STAGE_COMPLETE_MARKER, OutputBuffer
+from llm_cc.pipeline import _DONE_INSTRUCTION
 
 
 def _tick(buf: OutputBuffer, n: int = 1) -> None:
@@ -142,4 +143,74 @@ def test_stage_complete_clears_when_new_output():
     # Agent resumes (user typed something)
     buf.append("Starting new work...\r\n")
     _tick(buf)
+    assert not buf.appears_stage_complete
+
+
+# --- The prompt echo must not read as a completion ---
+
+
+def test_sentinel_marker_detected():
+    """The agent emitting the marker alone on a line is a completion."""
+    buf = OutputBuffer()
+    buf.append(f"Done with the work.\r\n{STAGE_COMPLETE_MARKER}\r\n")
+    _tick(buf, 5)
+    assert buf.appears_stage_complete
+
+
+def test_done_instruction_is_not_a_completion():
+    """REGRESSION: our own prompt echo must not trip completion detection.
+
+    Prompts are rendered into the agent's transcript, so the instruction asking
+    for the marker is on screen from the moment the stage starts. A substring
+    match fired here — auto-advancing the stage before any work happened.
+    """
+    buf = OutputBuffer()
+    buf.append(f"EXECUTE: Some task\r\n\r\n{_DONE_INSTRUCTION}\r\n")
+    _tick(buf, 20)
+    assert not buf.appears_stage_complete
+
+
+def test_legacy_prompt_echo_is_not_a_completion():
+    """Same guarantee for the pre-marker phrasing, taken from a real capture.
+
+    Verbatim from .llm-cc/logs/llmcc_c6c21bf9_planning.log, where this exact
+    line produced five spurious completion signals.
+    """
+    buf = OutputBuffer()
+    buf.append(
+        "Continue in the same session. You already have the plan in context.\r\n"
+        "Plan: .llm-cc/tasks/c6c21bf9/plan.md\r\n"
+        "\r\n"
+        "When finished, say: EXECUTE COMPLETE\r\n"
+    )
+    _tick(buf, 20)
+    assert not buf.appears_stage_complete
+
+
+def test_legacy_bare_marker_still_detected():
+    """A pre-marker session that declares completion on its own line still works."""
+    buf = OutputBuffer()
+    buf.append("When finished, say: EXECUTE COMPLETE\r\n")
+    _tick(buf, 5)
+    assert not buf.appears_stage_complete
+
+    # ...agent does the work, then declares it
+    buf.append("Did the thing.\r\nEXECUTE COMPLETE\r\n")
+    _tick(buf, 5)
+    assert buf.appears_stage_complete
+
+
+def test_marker_detected_through_cli_gutter():
+    """CLIs prefix output with bullets/quote bars; the marker still counts."""
+    buf = OutputBuffer()
+    buf.append(f"  ⏺ {STAGE_COMPLETE_MARKER}\r\n")
+    _tick(buf, 5)
+    assert buf.appears_stage_complete
+
+
+def test_marker_inside_prose_is_not_a_completion():
+    """The marker mentioned mid-sentence is discussion, not a declaration."""
+    buf = OutputBuffer()
+    buf.append(f"I will print {STAGE_COMPLETE_MARKER} once the tests pass.\r\n")
+    _tick(buf, 20)
     assert not buf.appears_stage_complete

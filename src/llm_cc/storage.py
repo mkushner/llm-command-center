@@ -5,10 +5,13 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import shutil
 import tempfile
+import time
 import tomllib
 from pathlib import Path
 
+from .log import logger
 from .models import (
     AgentConfig,
     GlobalConfig,
@@ -66,17 +69,16 @@ class Storage:
             with open(self.tasks_file) as f:
                 data = json.load(f)
             return TaskStore.model_validate(data)
-        except Exception:
-            # Backup corrupted file before returning empty store
-            import time as _time
-
-            backup = self.tasks_file.with_suffix(f".corrupt.{int(_time.time())}.json")
+        except Exception as e:
+            # Losing the task store is severe enough to always be worth a log,
+            # even though callers only ever see an empty store.
+            logger.error("tasks.json unreadable, falling back to empty store: %s", e)
+            backup = self.tasks_file.with_suffix(f".corrupt.{int(time.time())}.json")
             try:
-                import shutil as _shutil
-
-                _shutil.copy2(str(self.tasks_file), str(backup))
-            except Exception:
-                pass
+                shutil.copy2(str(self.tasks_file), str(backup))
+                logger.error("corrupt tasks.json backed up to %s", backup)
+            except OSError as copy_err:
+                logger.error("could not back up corrupt tasks.json: %s", copy_err)
             return TaskStore()
 
     def _write_store(self, store: TaskStore) -> None:

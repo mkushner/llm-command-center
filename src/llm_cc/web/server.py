@@ -13,7 +13,9 @@ import asyncio
 import contextlib
 import os
 import re
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 from ..agents import AgentRegistry, is_clean_exit_mode
@@ -24,12 +26,17 @@ from ..statusline import setup_statusline
 from ..storage import Storage
 from .state import build_state
 
+if TYPE_CHECKING:
+    from starlette.applications import Starlette
+    from starlette.requests import Request
+    from starlette.responses import Response
+
 # tmux session names are sanitized to this charset (agents._sanitize_session_name).
 _VALID_SESSION = re.compile(r"[A-Za-z0-9_-]{1,64}")
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 
-def _origin_ok(headers) -> bool:
+def _origin_ok(headers: Mapping[str, str]) -> bool:
     """CSWSH / CSRF guard for browser requests.
 
     Allow when the request is same-origin (Origin netloc == Host — works on any
@@ -71,7 +78,7 @@ async def _session_alive(session_id: str) -> bool:
     return proc.returncode == 0
 
 
-def create_app(project_path: Path):
+def create_app(project_path: Path) -> Starlette:
     from starlette.applications import Starlette
     from starlette.middleware import Middleware
     from starlette.middleware.base import BaseHTTPMiddleware
@@ -94,12 +101,12 @@ def create_app(project_path: Path):
 
     # --- REST: state ---
 
-    async def state_endpoint(request):
+    async def state_endpoint(request: Request) -> Response:
         return JSONResponse(await build_state(request.app.state))
 
     # --- REST: task CRUD ---
 
-    async def create_task(request):
+    async def create_task(request: Request) -> Response:
         body = await request.json()
         title = (body.get("title") or "").strip()
         if not title:
@@ -114,7 +121,7 @@ def create_app(project_path: Path):
         storage.save_task(task)
         return JSONResponse({"ok": True, "id": task.id})
 
-    async def edit_task(request):
+    async def edit_task(request: Request) -> Response:
         task = _fresh(request.path_params["task_id"])
         if not task:
             return JSONResponse({"error": "not found"}, status_code=404)
@@ -130,7 +137,7 @@ def create_app(project_path: Path):
         storage.save_task(task)
         return JSONResponse({"ok": True})
 
-    async def delete_task(request):
+    async def delete_task(request: Request) -> Response:
         task = _fresh(request.path_params["task_id"])
         if task and task.session_id:
             with contextlib.suppress(Exception):
@@ -140,41 +147,41 @@ def create_app(project_path: Path):
 
     # --- REST: pipeline ops (serialized) ---
 
-    async def _pipeline_op(request, op: str):
-        task = _fresh(request.path_params["task_id"])
-        if not task:
-            return JSONResponse({"error": "not found"}, status_code=404)
-        async with request.app.state.pipe_lock:
-            try:
-                if op == "advance":
-                    await pipeline.advance(task)
-                elif op == "revert":
-                    await pipeline.revert(task)
-                elif op == "restart":
-                    await pipeline.restart(task)
-                elif op == "stop":
-                    if task.session_id:
-                        await registry.stop_session(task.session_id)
-                        task.session_id = None
-                        task.touch()
-                        storage.save_task(task)
-            except Exception as e:
-                return JSONResponse({"error": str(e)}, status_code=500)
-        return JSONResponse({"ok": True})
+    async def _stop_task(task: Task) -> None:
+        if not task.session_id:
+            return
+        await registry.stop_session(task.session_id)
+        task.session_id = None
+        task.touch()
+        storage.save_task(task)
 
-    async def advance(request):
-        return await _pipeline_op(request, "advance")
+    pipeline_ops: dict[str, Callable[[Task], Awaitable[Any]]] = {
+        "advance": pipeline.advance,
+        "revert": pipeline.revert,
+        "restart": pipeline.restart,
+        "stop": _stop_task,
+    }
 
-    async def revert(request):
-        return await _pipeline_op(request, "revert")
+    def _pipeline_route(op: str) -> Callable[[Request], Awaitable[Response]]:
+        """Build a handler that runs one pipeline op under the shared lock.
 
-    async def restart(request):
-        return await _pipeline_op(request, "restart")
+        The lock serializes mutations the same way the TUI's exclusive worker
+        group does — two concurrent advances would race on tasks.json.
+        """
+        async def handler(request: Request) -> Response:
+            task = _fresh(request.path_params["task_id"])
+            if not task:
+                return JSONResponse({"error": "not found"}, status_code=404)
+            async with request.app.state.pipe_lock:
+                try:
+                    await pipeline_ops[op](task)
+                except Exception as e:
+                    return JSONResponse({"error": str(e)}, status_code=500)
+            return JSONResponse({"ok": True})
 
-    async def stop(request):
-        return await _pipeline_op(request, "stop")
+        return handler
 
-    async def diff(request):
+    async def diff(request: Request) -> Response:
         task = _fresh(request.path_params["task_id"])
         if not task:
             return JSONResponse({"error": "not found"}, status_code=404)
@@ -184,7 +191,7 @@ def create_app(project_path: Path):
             return JSONResponse({"error": str(e)}, status_code=500)
         return JSONResponse({"diff": text})
 
-    async def send_reply(request):
+    async def send_reply(request: Request) -> Response:
         task = _fresh(request.path_params["task_id"])
         if not task or not task.session_id:
             return JSONResponse({"error": "no active session"}, status_code=404)
@@ -200,7 +207,7 @@ def create_app(project_path: Path):
 
     # --- WebSocket: board state ---
 
-    async def board_ws(ws: WebSocket):
+    async def board_ws(ws: WebSocket) -> None:
         if not _origin_ok(ws.headers):
             await ws.close(code=1008)
             return
@@ -214,7 +221,7 @@ def create_app(project_path: Path):
 
     # --- WebSocket: interactive terminal ---
 
-    async def pty_ws(ws: WebSocket):
+    async def pty_ws(ws: WebSocket) -> None:
         session_id = ws.path_params["session_id"]
         # Reject cross-origin (CSWSH) and malformed/flag-smuggling session ids.
         if not _origin_ok(ws.headers) or not _VALID_SESSION.fullmatch(session_id):
@@ -231,7 +238,7 @@ def create_app(project_path: Path):
             cols, rows = 120, 32
         await attach(ws, session_id, cols, rows)
 
-    async def no_dist_page(request):
+    async def no_dist_page(request: Request) -> Response:
         return HTMLResponse(
             "<pre style='font:14px monospace;color:#d7dde6;background:#0a0d12;"
             "padding:40px'>llm-cc web backend is running.\n\n"
@@ -245,10 +252,10 @@ def create_app(project_path: Path):
         Route("/api/task", create_task, methods=["POST"]),
         Route("/api/task/{task_id}", edit_task, methods=["PUT"]),
         Route("/api/task/{task_id}", delete_task, methods=["DELETE"]),
-        Route("/api/task/{task_id}/advance", advance, methods=["POST"]),
-        Route("/api/task/{task_id}/revert", revert, methods=["POST"]),
-        Route("/api/task/{task_id}/restart", restart, methods=["POST"]),
-        Route("/api/task/{task_id}/stop", stop, methods=["POST"]),
+        *[
+            Route(f"/api/task/{{task_id}}/{op}", _pipeline_route(op), methods=["POST"])
+            for op in pipeline_ops
+        ],
         Route("/api/task/{task_id}/diff", diff),
         Route("/api/task/{task_id}/input", send_reply, methods=["POST"]),
         WebSocketRoute("/ws/board", board_ws),
@@ -261,14 +268,17 @@ def create_app(project_path: Path):
     else:
         routes.append(Route("/", no_dist_page))
 
-    async def csrf_guard(request, call_next):
+    async def csrf_guard(
+        request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
         # Block cross-origin browser writes (form-POST CSRF); reads stay open.
-        if request.method in ("POST", "PUT", "DELETE", "PATCH") and not _origin_ok(request.headers):
+        write = request.method in ("POST", "PUT", "DELETE", "PATCH")
+        if write and not _origin_ok(request.headers):
             return JSONResponse({"error": "forbidden origin"}, status_code=403)
         return await call_next(request)
 
     @contextlib.asynccontextmanager
-    async def lifespan(app):
+    async def lifespan(app: Starlette) -> AsyncIterator[None]:
         with contextlib.suppress(Exception):
             await registry.reattach_existing(project_path)
         yield

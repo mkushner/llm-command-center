@@ -1,4 +1,9 @@
-"""Agent health monitoring: error detection, context tracking, health scoring, session persistence."""
+"""Agent health monitoring.
+
+Error detection, context tracking, health scoring, session persistence — plus the
+shared presentation helpers (`status_kind`, `AgentHealth.context_tokens`) that the
+TUI board and the web state snapshot both derive their card status from.
+"""
 
 from __future__ import annotations
 
@@ -9,6 +14,9 @@ from collections import deque
 from dataclasses import dataclass, field
 from enum import IntEnum
 from pathlib import Path
+from typing import Any
+
+from .log import logger
 
 # --- Error Detection ---
 
@@ -132,7 +140,7 @@ class ContextMonitor:
                 if 0 <= pct <= 100:
                     self.context_percent = pct
 
-    def update_from_status(self, status_data: dict) -> None:
+    def update_from_status(self, status_data: dict[str, Any]) -> None:
         """Update from Claude Code statusline JSON — overrides screen scraping.
 
         Computes used % from raw token counts when available.  Falls back to the
@@ -216,13 +224,63 @@ class AgentHealth:
 
     @property
     def context_color(self) -> str | None:
-        if self.context_remaining is None:
+        return context_color(self.context_remaining)
+
+    @property
+    def context_tokens(self) -> int | None:
+        """Tokens currently occupying the context window, None if unknown.
+
+        Output tokens are excluded — they aren't resident in the window.
+        """
+        total = (
+            (self.input_tokens or 0)
+            + (self.cache_creation_tokens or 0)
+            + (self.cache_read_tokens or 0)
+        )
+        return total or None
+
+    @property
+    def top_error(self) -> str | None:
+        """Name of the most severe recent error, None if clean."""
+        if not self.errors:
             return None
-        if self.context_remaining >= 70:
-            return "green"
-        if self.context_remaining >= 30:
-            return "yellow"
-        return "red"
+        return max(self.errors, key=lambda e: e.severity).pattern_name
+
+
+def context_color(remaining: int | None) -> str | None:
+    """Colour for a context-remaining percentage. None if unknown."""
+    if remaining is None:
+        return None
+    if remaining >= 70:
+        return "green"
+    if remaining >= 30:
+        return "yellow"
+    return "red"
+
+
+def status_kind(
+    *,
+    has_session: bool,
+    in_active_stage: bool,
+    top_error: str | None,
+    complete: bool,
+    waiting: bool,
+) -> str | None:
+    """Resolve an agent's single status label.
+
+    One ladder shared by the TUI card chip, the TUI poll loop and the web state
+    snapshot so the two frontends can't drift:
+    error > stale > ready > waiting > running.
+    """
+    if not has_session:
+        return "stale" if in_active_stage else None
+    if top_error:
+        return "error"
+    if complete:
+        return "ready"
+    if waiting:
+        return "waiting"
+    return "running"
 
 
 class HealthScorer:
@@ -239,7 +297,13 @@ class HealthScorer:
         self._total_bytes += data_len
         self._last_output_time = time.monotonic()
 
-    def compute(self, alive: bool, stable_ticks: int, screen_text: str, status_data: dict | None = None) -> AgentHealth:
+    def compute(
+        self,
+        alive: bool,
+        stable_ticks: int,
+        screen_text: str,
+        status_data: dict[str, Any] | None = None,
+    ) -> AgentHealth:
         """Compute health score from current state."""
         # Run detectors
         self.error_detector.scan(screen_text)
@@ -317,7 +381,7 @@ class HealthScorer:
 class SessionEvent:
     type: str  # "output", "error", "health", "stage"
     timestamp: float
-    data: dict
+    data: dict[str, Any]
 
 
 @dataclass
@@ -327,13 +391,17 @@ class SessionContext:
     stage: str
     agent_name: str
     start_time: float
-    events: deque = field(default_factory=lambda: deque(maxlen=50))
+    events: deque[SessionEvent] = field(default_factory=lambda: deque(maxlen=50))
     _dirty: bool = field(default=False, repr=False)
     _last_write: float = field(default=0.0, repr=False)
 
-    def add_event(self, event_type: str, data: dict) -> None:
+    def add_event(self, event_type: str, data: dict[str, Any]) -> None:
         self.events.append(SessionEvent(event_type, time.monotonic(), data))
         self._dirty = True
+
+    @property
+    def is_dirty(self) -> bool:
+        return self._dirty
 
     def needs_write(self, interval: float = 3.0) -> bool:
         """True if dirty AND enough time since last write."""
@@ -343,7 +411,7 @@ class SessionContext:
         self._dirty = False
         self._last_write = time.monotonic()
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "session_id": self.session_id,
             "task_id": self.task_id,
@@ -357,7 +425,7 @@ class SessionContext:
         }
 
     @classmethod
-    def from_dict(cls, d: dict) -> SessionContext:
+    def from_dict(cls, d: dict[str, Any]) -> SessionContext:
         ctx = cls(
             session_id=d["session_id"],
             task_id=d["task_id"],
@@ -369,7 +437,9 @@ class SessionContext:
             ctx.events.append(SessionEvent(ev["type"], ev["timestamp"], ev["data"]))
         return ctx
 
-    def generate_handoff(self, task_title: str, verify: str | None = None, done: str | None = None) -> str:
+    def generate_handoff(
+        self, task_title: str, verify: str | None = None, done: str | None = None
+    ) -> str:
         """Produce human-readable markdown handoff file."""
         lines = [
             f"# Handoff: {task_title}",
@@ -451,8 +521,8 @@ class SessionStore:
             try:
                 if now - f.stat().st_mtime > max_age:
                     f.unlink()
-            except Exception:
-                pass
+            except OSError as e:
+                logger.debug("session cleanup failed for %s: %s", f, e)
 
     def get_or_create(
         self, session_id: str, task_id: str, stage: str, agent_name: str,
@@ -469,8 +539,8 @@ class SessionStore:
                 ctx = SessionContext.from_dict(data)
                 self._contexts[session_id] = ctx
                 return ctx
-            except Exception:
-                pass
+            except (OSError, ValueError, KeyError) as e:
+                logger.debug("could not restore session %s, starting fresh: %s", session_id, e)
 
         ctx = SessionContext(
             session_id=session_id,
@@ -502,7 +572,7 @@ class SessionStore:
     def flush_all(self) -> None:
         """Write all dirty contexts. Called on shutdown."""
         for ctx in self._contexts.values():
-            if ctx._dirty:
+            if ctx.is_dirty:
                 self._write(ctx)
 
     def remove(self, session_id: str) -> SessionContext | None:
@@ -514,5 +584,5 @@ class SessionStore:
         try:
             path.write_text(json.dumps(ctx.to_dict(), indent=2))
             ctx.mark_written()
-        except Exception:
-            pass
+        except (OSError, TypeError) as e:
+            logger.debug("session persist failed for %s: %s", ctx.session_id, e)

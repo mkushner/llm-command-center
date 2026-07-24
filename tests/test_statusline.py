@@ -1,4 +1,4 @@
-"""Tests for statusline integration: status file parsing, health, env var injection, script setup."""
+"""Statusline integration: status file parsing, health, env injection, script setup."""
 
 import json
 import os
@@ -104,7 +104,9 @@ def test_health_scorer_status_overrides_screen():
         "context_window": {"used_percentage": 50},
     }
     # Screen says 90% but statusline says 50%
-    h = scorer.compute(alive=True, stable_ticks=0, screen_text="context: 90%", status_data=status_data)
+    h = scorer.compute(
+        alive=True, stable_ticks=0, screen_text="context: 90%", status_data=status_data
+    )
     assert h.context_remaining == 50  # from statusline, not screen
 
 
@@ -329,7 +331,12 @@ def test_statusline_settings_updates_own_path(tmp_path):
         # Existing settings pointing to an old llm-cc script path
         settings_path = fake_home / ".claude" / "settings.local.json"
         settings_path.parent.mkdir(parents=True, exist_ok=True)
-        old = {"statusLine": {"type": "command", "command": "python3 /old/path/.llm-cc/bin/statusline.py"}}
+        old = {
+            "statusLine": {
+                "type": "command",
+                "command": "python3 /old/path/.llm-cc/bin/statusline.py",
+            }
+        }
         settings_path.write_text(json.dumps(old))
 
         setup_statusline(tmp_path)

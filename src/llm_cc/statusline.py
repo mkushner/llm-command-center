@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 STATUSLINE_SCRIPT = '''\
 #!/usr/bin/env python3
@@ -59,7 +60,7 @@ def setup_statusline(project_path: Path) -> None:
     script_path.chmod(0o755)
 
     settings_path = Path.home() / ".claude" / "settings.local.json"
-    settings: dict = {}
+    settings: dict[str, Any] = {}
     if settings_path.exists():
         try:
             settings = json.loads(settings_path.read_text())

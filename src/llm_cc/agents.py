@@ -9,13 +9,15 @@ import os
 import re
 import shlex
 import shutil
+import subprocess
 import time
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import IO, Any, Protocol, runtime_checkable
 
 from rich.text import Text
 
 from .health import AgentHealth, HealthScorer, SessionStore
+from .log import logger
 from .models import AgentConfig, AgentMode, Task
 
 # --- Protocol ---
@@ -23,7 +25,23 @@ from .models import AgentConfig, AgentMode, Task
 
 @runtime_checkable
 class AgentBackend(Protocol):
-    async def start(self, config: AgentConfig, task: Task, prompt: str, cwd: Path, stage: str = "", cli_flags: str = "") -> str: ...
+    """Everything the UI layer may call on a backend.
+
+    Both `TmuxBackend` and `ApiBackend` implement all of it — API sessions return
+    inert values for the terminal-only parts rather than omitting the methods, so
+    callers never have to probe with `hasattr`.
+    """
+
+    async def start(
+        self,
+        config: AgentConfig,
+        task: Task,
+        prompt: str,
+        cwd: Path,
+        stage: str = "",
+        cli_flags: str = "",
+        terminal_size: tuple[int, int] | None = None,
+    ) -> str: ...
     async def resume(self, session_id: str, prompt: str) -> None: ...
     async def stop(self, session_id: str) -> None: ...
     async def send_input(self, session_id: str, text: str) -> None: ...
@@ -32,6 +50,13 @@ class AgentBackend(Protocol):
     async def get_output_rich(self, session_id: str) -> Text | None: ...
     async def get_history_rich(self, session_id: str) -> list[Text]: ...
     def is_alive(self, session_id: str) -> bool: ...
+    def has_session(self, session_id: str) -> bool: ...
+    def is_stage_complete(self, session_id: str) -> bool: ...
+    def is_waiting_for_input(self, session_id: str) -> bool: ...
+    def health(self, session_id: str) -> AgentHealth | None: ...
+    def status_data(self, session_id: str) -> dict[str, Any] | None: ...
+    def resize_session(self, session_id: str, cols: int, rows: int) -> None: ...
+    def active_session_ids(self) -> list[str]: ...
 
 
 # --- Output Buffer ---
@@ -57,12 +82,34 @@ _INPUT_PATTERNS = (
     "how can i help",
 )
 
-# Stage completion markers — agent declares stage done
-_COMPLETE_PATTERNS = (
+# The marker an agent prints to declare its stage finished.
+#
+# Matched whole-line, not as a substring. The prompt that *asks* for this marker
+# necessarily contains it too — prompts are rendered into the agent's own
+# transcript — so a substring match fires on our own instruction as soon as the
+# screen settles, before any work happens. Requiring the marker to be the entire
+# line separates the agent's declaration from our request for it, because the
+# instruction always carries "When done, output: " on the same line.
+#
+# `pipeline._DONE_INSTRUCTION` is built from this constant so the two can't drift,
+# and is kept short enough that a pane can't wrap the marker onto a line of its
+# own (which would look like a declaration).
+STAGE_COMPLETE_MARKER = "<<<LLM-CC-DONE>>>"
+
+# Pre-marker phrasing, still honoured under the same whole-line rule so sessions
+# started before this existed — and agents that paraphrase — aren't stranded.
+_LEGACY_COMPLETE_MARKERS = (
     "planning complete",
     "execute complete",
     "review complete",
 )
+
+_COMPLETE_MARKERS = (STAGE_COMPLETE_MARKER.lower(), *_LEGACY_COMPLETE_MARKERS)
+
+# Gutter decoration a CLI may print before the marker (bullets, quote bars).
+# Stripped before comparing; `<` is deliberately absent so the marker's own
+# leading brackets survive.
+_GUTTER_CHARS = " \t>⏺•·│┃*-"
 
 
 class OutputBuffer:
@@ -76,20 +123,32 @@ class OutputBuffer:
       the configured row height so heuristics over a "screen" still work.
     """
 
-    def __init__(self, log_path: Path | None = None, cols: int = 120, rows: int = 40) -> None:
-        self._cols = cols
+    def __init__(self, log_path: Path | None = None, rows: int = 40) -> None:
         self._rows = rows
         self._plain_viewport: str = ""
         self._ansi_viewport: str = ""
         self._ansi_history: str = ""
-        self._log_file = None
+        self._log_file: IO[str] | None = None
         self._last_content: str = ""
         self._stable_ticks: int = 0
-        self._total_bytes: int = 0
-        self._last_output_time: float = 0.0
+        # Derived views, rebuilt lazily and invalidated on every write. The poll
+        # loop reads these several times per tick per session, so recomputing
+        # them each time is the difference between free and ~1ms of string work.
+        self._display: str | None = None
+        self._display_lower: str | None = None
+        self._complete_marker: bool | None = None
+        self._rich_key: str | None = None
+        self._rich: Text | None = None
+        self._history_key: str | None = None
+        self._history: list[Text] = []
         if log_path:
             log_path.parent.mkdir(parents=True, exist_ok=True)
             self._log_file = open(log_path, "a")
+
+    def _invalidate(self) -> None:
+        self._display = None
+        self._display_lower = None
+        self._complete_marker = None
 
     def append(self, data: str) -> None:
         """Append plain text. Used by ApiBackend and by tests."""
@@ -100,26 +159,32 @@ class OutputBuffer:
         if len(lines) > self._rows:
             self._plain_viewport = "\n".join(lines[-self._rows:])
         self._ansi_viewport = self._plain_viewport
-        self._total_bytes += len(data)
-        self._last_output_time = time.monotonic()
-        if self._log_file:
+        self._invalidate()
+        if self._log_file is not None:
             self._log_file.write(data)
             self._log_file.flush()
 
-    def set_capture(self, plain: str, viewport_ansi: str, history_ansi: str) -> None:
-        """Replace internal state from a tmux capture-pane snapshot."""
+    def set_capture(
+        self, plain: str, viewport_ansi: str, history_ansi: str | None = None
+    ) -> None:
+        """Replace internal state from a tmux capture-pane snapshot.
+
+        `history_ansi=None` keeps the existing scrollback — the poll loop only
+        re-captures it every few ticks.
+        """
         self._plain_viewport = plain
         self._ansi_viewport = viewport_ansi
-        self._ansi_history = history_ansi
-        self._last_output_time = time.monotonic()
+        if history_ansi is not None:
+            self._ansi_history = history_ansi
+        self._invalidate()
 
     @property
-    def stats(self) -> tuple[int, float, int]:
-        """Return (total_bytes, last_output_time, stable_ticks)."""
-        return (self._total_bytes, self._last_output_time, self._stable_ticks)
+    def stable_ticks(self) -> int:
+        """Consecutive poll ticks with unchanged visible content."""
+        return self._stable_ticks
 
     def mark_idle(self) -> None:
-        """Called each poll tick (~0.1s). Tracks if visible content has changed."""
+        """Called each poll tick (~0.2s). Tracks if visible content has changed."""
         current = self.display()
         if current == self._last_content:
             self._stable_ticks += 1
@@ -129,46 +194,68 @@ class OutputBuffer:
 
     def display(self) -> str:
         """Current viewport as clean plain text, trailing whitespace trimmed."""
-        text = self._plain_viewport.replace("\r\n", "\n").replace("\r", "\n")
-        cleaned = [line.rstrip() for line in text.split("\n")]
-        while cleaned and not cleaned[-1]:
-            cleaned.pop()
-        return "\n".join(cleaned)
+        if self._display is None:
+            text = self._plain_viewport.replace("\r\n", "\n").replace("\r", "\n")
+            cleaned = [line.rstrip() for line in text.split("\n")]
+            while cleaned and not cleaned[-1]:
+                cleaned.pop()
+            self._display = "\n".join(cleaned)
+        return self._display
+
+    def _display_lowered(self) -> str:
+        if self._display_lower is None:
+            self._display_lower = self.display().lower()
+        return self._display_lower
 
     def display_rich(self) -> Text:
         """Viewport as Rich Text with ANSI colors preserved."""
-        return Text.from_ansi(self._ansi_viewport.rstrip())
+        if self._rich_key != self._ansi_viewport:
+            self._rich = Text.from_ansi(self._ansi_viewport.rstrip())
+            self._rich_key = self._ansi_viewport
+        assert self._rich is not None
+        return self._rich
 
     def history_rich(self) -> list[Text]:
-        """Scrollback history above the viewport, line by line."""
-        if not self._ansi_history:
-            return []
-        return [Text.from_ansi(line) for line in self._ansi_history.splitlines()]
+        """Scrollback history above the viewport, line by line.
 
-    @property
-    def total_lines(self) -> int:
-        """Total lines: history + viewport."""
-        hist = self._ansi_history.count("\n") if self._ansi_history else 0
-        view = self._plain_viewport.count("\n") + (1 if self._plain_viewport else 0)
-        return hist + view
+        Cached on the raw capture: this parses up to 5000 lines and the viewer
+        asks for it 5x/second, but it only changes when lines scroll off.
+        """
+        if self._history_key != self._ansi_history:
+            self._history = (
+                [Text.from_ansi(line) for line in self._ansi_history.splitlines()]
+                if self._ansi_history
+                else []
+            )
+            self._history_key = self._ansi_history
+        return self._history
 
-    def resize(self, cols: int, rows: int) -> None:
-        self._cols = cols
+    def resize(self, rows: int) -> None:
         self._rows = rows
+
+    def _has_complete_marker(self) -> bool:
+        """True if any visible line is *only* a completion marker.
+
+        Cached with the rest of the derived views — this walks the whole viewport
+        and the poll loops ask for it several times a second per session.
+        """
+        if self._complete_marker is None:
+            self._complete_marker = any(
+                line.strip().lstrip(_GUTTER_CHARS).strip() in _COMPLETE_MARKERS
+                for line in self._display_lowered().split("\n")
+            )
+        return self._complete_marker
 
     @property
     def appears_stage_complete(self) -> bool:
         """Agent posted a stage completion marker. Requires settled content."""
-        if self._stable_ticks < 3:
-            return False
-        screen_text = self.display().lower()
-        return any(p in screen_text for p in _COMPLETE_PATTERNS)
+        return self._stable_ticks >= 3 and self._has_complete_marker()
 
     @property
     def appears_waiting(self) -> bool:
         """Heuristic: agent seems to be waiting for user input.
 
-        Triggers when the visible screen content hasn't changed for ~0.3s
+        Triggers when the visible screen content hasn't changed for ~0.6s
         AND the screen matches known input prompt patterns.
         Does NOT trigger for stage completion — that's a separate state.
         """
@@ -176,15 +263,15 @@ class OutputBuffer:
             return False
         if self.appears_stage_complete:
             return False
-        screen_text = self.display().lower()
+        screen_text = self._display_lowered()
         return any(p in screen_text for p in _INPUT_PATTERNS)
 
     def close(self) -> None:
-        if self._log_file:
+        if self._log_file is not None:
             try:
                 self._log_file.close()
-            except Exception:
-                pass
+            except OSError as e:
+                logger.debug("output buffer close failed: %s", e)
             self._log_file = None
 
 
@@ -194,8 +281,12 @@ class OutputBuffer:
 _TMUX_NAME_BAD = re.compile(r"[^A-Za-z0-9_-]")
 
 
-def _sanitize_session_name(raw: str) -> str:
-    """Tmux disallows `.` and `:` in session names; keep alnum + _ + -."""
+def sanitize_session_name(raw: str) -> str:
+    """Reduce a string to tmux's session-name charset: alnum + `_` + `-`.
+
+    Also the single source of truth for Textual widget ids derived from session
+    ids (`ui/panels.py`), which need the same restriction.
+    """
     return _TMUX_NAME_BAD.sub("_", raw)
 
 
@@ -207,12 +298,15 @@ async def _tmux(*args: str) -> tuple[int, bytes, bytes]:
         stderr=asyncio.subprocess.PIPE,
     )
     out, err = await proc.communicate()
-    return proc.returncode, out, err
+    return proc.returncode or 0, out, err
 
 
 def _tmux_sync(*args: str) -> tuple[int, bytes]:
-    """Synchronous tmux call (no shell) for is_alive checks and atexit cleanup."""
-    import subprocess
+    """Blocking tmux call. Only for atexit cleanup and cold `is_alive` misses.
+
+    Forking costs ~9ms, which is why the poll loop never calls this — it takes
+    liveness from the async `_capture` it already performs.
+    """
     try:
         result = subprocess.run(
             ["tmux", *args],
@@ -250,11 +344,20 @@ _RAW_TO_TMUX_KEY = {
 }
 
 
+# How long a sampled liveness result stays usable. The poll loop refreshes every
+# 0.2s, so external callers effectively always hit the cache.
+_ALIVE_TTL = 1.0
+
+# Scrollback only changes when lines scroll off the pane, so re-capturing 5000
+# lines at the full poll rate is waste. Every Nth tick is plenty.
+_HISTORY_EVERY_N_TICKS = 5
+
+
 class TmuxBackend:
     """Spawns CLI agents in tmux sessions. tmux owns the PTY layer."""
 
     def __init__(self, process_manager: _ProcessManager | None = None) -> None:
-        self._sessions: dict[str, str] = {}  # session_id -> tmux session name (same value)
+        self._sessions: set[str] = set()
         self._buffers: dict[str, OutputBuffer] = {}
         self._log_paths: dict[str, Path] = {}
         self._poll_tasks: dict[str, asyncio.Task[None]] = {}
@@ -263,9 +366,14 @@ class TmuxBackend:
         self._health_scorers: dict[str, HealthScorer] = {}
         self._session_store: SessionStore | None = None
         self._status_files: dict[str, Path] = {}
+        self._alive: dict[str, tuple[bool, float]] = {}  # session_id -> (alive, sampled_at)
+        self._resize_tasks: set[asyncio.Task[tuple[int, bytes, bytes]]] = set()
 
     def set_session_store(self, store: SessionStore) -> None:
         self._session_store = store
+
+    def _record_alive(self, session_id: str, alive: bool) -> None:
+        self._alive[session_id] = (alive, time.monotonic())
 
     async def start(
         self,
@@ -277,7 +385,7 @@ class TmuxBackend:
         cli_flags: str = "",
         terminal_size: tuple[int, int] | None = None,
     ) -> str:
-        session_id = _sanitize_session_name(
+        session_id = sanitize_session_name(
             f"llmcc_{task.id}_{stage or task.status.value}"
         )
 
@@ -362,11 +470,12 @@ class TmuxBackend:
         pipe_cmd = f"cat >> {shlex.quote(str(log_path))}"
         await _tmux("pipe-pane", "-t", session_id, "-o", pipe_cmd)
 
-        self._sessions[session_id] = session_id
+        self._sessions.add(session_id)
         # OutputBuffer log_path is None — pipe-pane is the sole writer.
-        self._buffers[session_id] = OutputBuffer(log_path=None, cols=cols, rows=rows)
+        self._buffers[session_id] = OutputBuffer(log_path=None, rows=rows)
         self._log_paths[session_id] = log_path
         self._health_scorers[session_id] = HealthScorer()
+        self._record_alive(session_id, True)
 
         # Create session context for persistence
         if self._session_store:
@@ -377,7 +486,7 @@ class TmuxBackend:
         # Register with process manager only in --clean-exit mode; otherwise
         # the session is allowed to outlive llm-cc.
         if self._pm and _clean_exit_mode:
-            self._pm.register(session_id, session_id)
+            self._pm.register(session_id)
 
         # Tail the pipe-pane log into OutputBuffer
         self._poll_tasks[session_id] = asyncio.create_task(
@@ -418,16 +527,16 @@ class TmuxBackend:
         await _tmux("pipe-pane", "-t", session_id, "-o", pipe_cmd)
 
         try:
-            ts = os.get_terminal_size()
-            cols, rows = ts.columns, ts.lines
+            rows = os.get_terminal_size().lines
         except OSError:
-            cols, rows = 120, 40
+            rows = 40
 
-        self._sessions[session_id] = session_id
-        self._buffers[session_id] = OutputBuffer(log_path=None, cols=cols, rows=rows)
+        self._sessions.add(session_id)
+        self._buffers[session_id] = OutputBuffer(log_path=None, rows=rows)
         self._log_paths[session_id] = log_path
         self._health_scorers[session_id] = HealthScorer()
         self._status_files[session_id] = cwd / ".llm-cc" / "status" / f"{task.id}.json"
+        self._record_alive(session_id, True)
 
         if self._session_store:
             self._session_store.get_or_create(
@@ -435,7 +544,7 @@ class TmuxBackend:
             )
 
         if self._pm and _clean_exit_mode:
-            self._pm.register(session_id, session_id)
+            self._pm.register(session_id)
 
         self._poll_tasks[session_id] = asyncio.create_task(
             self._poll_output(session_id, log_path)
@@ -447,34 +556,19 @@ class TmuxBackend:
 
         Used at app shutdown so sessions persist for the next launch.
         """
-        poll = self._poll_tasks.pop(session_id, None)
-        if poll:
-            poll.cancel()
-            try:
-                await poll
-            except asyncio.CancelledError:
-                pass
-
-        self._sessions.pop(session_id, None)
-        if self._pm:
-            self._pm.unregister(session_id)
-
-        # Status file stays on disk — the underlying agent process is still
-        # writing to it.
-        self._status_files.pop(session_id, None)
-        self._health_scorers.pop(session_id, None)
-        if self._session_store:
-            self._session_store.flush_force(session_id)
-            self._session_store.remove(session_id)
-
-        self._interrupted.discard(session_id)
-        self._log_paths.pop(session_id, None)
-        buf = self._buffers.pop(session_id, None)
-        if buf:
-            buf.close()
+        await self._teardown(session_id, kill=False)
 
     async def stop(self, session_id: str) -> None:
-        # Cancel poll task
+        """Tear down local state and kill the tmux session."""
+        await self._teardown(session_id, kill=True)
+
+    async def _teardown(self, session_id: str, *, kill: bool) -> None:
+        """Release everything held for a session.
+
+        `kill=True` also destroys the tmux session and the status file;
+        `kill=False` leaves both alone because the agent process is still
+        running and still writing to them.
+        """
         poll = self._poll_tasks.pop(session_id, None)
         if poll:
             poll.cancel()
@@ -483,20 +577,21 @@ class TmuxBackend:
             except asyncio.CancelledError:
                 pass
 
-        # Kill tmux session (idempotent — tmux returns non-zero if already gone)
-        name = self._sessions.pop(session_id, None)
-        if name:
-            await _tmux("kill-session", "-t", name)
+        existed = session_id in self._sessions
+        self._sessions.discard(session_id)
+        if kill and existed:
+            # Idempotent — tmux returns non-zero if the session is already gone.
+            await _tmux("kill-session", "-t", session_id)
 
         if self._pm:
             self._pm.unregister(session_id)
 
         status_file = self._status_files.pop(session_id, None)
-        if status_file and status_file.exists():
+        if kill and status_file and status_file.exists():
             try:
                 status_file.unlink()
-            except Exception:
-                pass
+            except OSError as e:
+                logger.debug("could not remove status file %s: %s", status_file, e)
 
         self._health_scorers.pop(session_id, None)
         if self._session_store:
@@ -504,6 +599,7 @@ class TmuxBackend:
             self._session_store.remove(session_id)
 
         self._interrupted.discard(session_id)
+        self._alive.pop(session_id, None)
         self._log_paths.pop(session_id, None)
         buf = self._buffers.pop(session_id, None)
         if buf:
@@ -556,17 +652,35 @@ class TmuxBackend:
         """Resize tmux window and the virtual terminal buffer."""
         buf = self._buffers.get(session_id)
         if buf:
-            buf.resize(cols, rows)
+            buf.resize(rows)
         if session_id in self._sessions:
-            asyncio.create_task(
+            task = asyncio.create_task(
                 _tmux("resize-window", "-t", session_id, "-x", str(cols), "-y", str(rows))
             )
+            # Keep a reference so the task isn't garbage-collected mid-flight.
+            self._resize_tasks.add(task)
+            task.add_done_callback(self._resize_tasks.discard)
+
+    def has_session(self, session_id: str) -> bool:
+        """True if this backend is tracking the session (no tmux call)."""
+        return session_id in self._sessions
 
     def is_alive(self, session_id: str) -> bool:
+        """Liveness, served from the poll loop's sample when it is fresh.
+
+        The poll loop records a result every 0.2s from the capture it already
+        performs, so this normally costs nothing. Only a cold or stale entry
+        (no poll loop running yet, or one that has stopped) pays for a fork.
+        """
         if session_id not in self._sessions:
             return False
+        cached = self._alive.get(session_id)
+        if cached is not None and time.monotonic() - cached[1] < _ALIVE_TTL:
+            return cached[0]
         rc, _ = _tmux_sync("has-session", "-t", session_id)
-        return rc == 0
+        alive = rc == 0
+        self._record_alive(session_id, alive)
+        return alive
 
     def is_stage_complete(self, session_id: str) -> bool:
         buf = self._buffers.get(session_id)
@@ -584,10 +698,9 @@ class TmuxBackend:
         if not scorer or not buf:
             return None
         alive = self.is_alive(session_id)
-        _, _, stable_ticks = buf.stats
         screen_text = buf.display()
         status_data = self._read_status_file(session_id)
-        h = scorer.compute(alive, stable_ticks, screen_text, status_data)
+        h = scorer.compute(alive, buf.stable_ticks, screen_text, status_data)
 
         if self._session_store:
             ctx = self._session_store.get(session_id)
@@ -600,24 +713,54 @@ class TmuxBackend:
                 self._session_store.flush(session_id)
         return h
 
-    def status_data(self, session_id: str) -> dict | None:
+    def status_data(self, session_id: str) -> dict[str, Any] | None:
         return self._read_status_file(session_id)
 
-    def _read_status_file(self, session_id: str) -> dict | None:
+    def _read_status_file(self, session_id: str) -> dict[str, Any] | None:
         status_file = self._status_files.get(session_id)
         if not status_file or not status_file.exists():
             return None
         try:
-            return json.loads(status_file.read_text())
-        except Exception:
+            data = json.loads(status_file.read_text())
+        except (OSError, ValueError) as e:
+            # Expected transiently: the statusline hook rewrites this file
+            # non-atomically, so a read can land mid-write.
+            logger.debug("status file unreadable for %s: %s", session_id, e)
             return None
+        return data if isinstance(data, dict) else None
 
     @staticmethod
     def context_monitor_warning(scorer: HealthScorer) -> str | None:
         return scorer.context_monitor.warning_level
 
     def active_session_ids(self) -> list[str]:
-        return list(self._sessions.keys())
+        return list(self._sessions)
+
+    def _drain_activity(self, session_id: str, log_fd: IO[bytes] | None) -> None:
+        """Read whatever pipe-pane appended; feed byte counts to health scoring.
+
+        The bytes are not rendered — capture-pane is the source of truth for the
+        screen. This only measures that the agent is producing *something*, and
+        keeps a short excerpt for the session handoff file.
+        """
+        if log_fd is None:
+            return
+        try:
+            data = log_fd.read()
+        except OSError as e:
+            logger.debug("activity log read failed for %s: %s", session_id, e)
+            return
+        if not data:
+            return
+        scorer = self._health_scorers.get(session_id)
+        if scorer:
+            scorer.record_output(len(data))
+        if self._session_store:
+            ctx = self._session_store.get(session_id)
+            if ctx:
+                ctx.add_event(
+                    "output", {"text": data[-200:].decode("utf-8", errors="replace")}
+                )
 
     async def _poll_output(self, session_id: str, log_path: Path) -> None:
         """Periodic capture-pane snapshots → OutputBuffer; tail log for activity."""
@@ -632,73 +775,67 @@ class TmuxBackend:
             await asyncio.sleep(0.05)
 
         try:
-            log_fd = log_path.open("rb")
-        except OSError:
+            log_fd: IO[bytes] | None = log_path.open("rb")
+        except OSError as e:
+            logger.debug("could not open activity log %s: %s", log_path, e)
             log_fd = None
 
+        tick = 0
         try:
             while True:
-                # Activity tracking: read whatever pipe-pane has appended.
-                # We don't feed it into OutputBuffer (capture-pane is the source
-                # of truth for rendering); we just count bytes for health scoring
-                # and record an excerpt for the session log.
-                if log_fd is not None:
-                    try:
-                        data = log_fd.read()
-                    except Exception:
-                        data = b""
-                    if data:
-                        scorer = self._health_scorers.get(session_id)
-                        if scorer:
-                            scorer.record_output(len(data))
-                        if self._session_store:
-                            ctx = self._session_store.get(session_id)
-                            if ctx:
-                                excerpt = data[-200:].decode("utf-8", errors="replace")
-                                ctx.add_event("output", {"text": excerpt})
+                self._drain_activity(session_id, log_fd)
 
-                alive = self.is_alive(session_id)
-                if alive:
-                    plain, viewport_ansi, history_ansi = await self._capture(session_id)
-                    if plain is not None:
-                        buf.set_capture(plain, viewport_ansi or "", history_ansi or "")
+                # Liveness comes from the capture itself: capture-pane fails once
+                # the session is gone, so a separate blocking has-session probe
+                # would be a second fork telling us what we already know.
+                with_history = tick % _HISTORY_EVERY_N_TICKS == 0
+                captured = await self._capture(session_id, with_history=with_history)
+                alive = captured is not None
+                self._record_alive(session_id, alive)
+                if captured is not None:
+                    viewport_ansi, history_ansi = captured
+                    plain = Text.from_ansi(viewport_ansi).plain
+                    buf.set_capture(plain, viewport_ansi, history_ansi)
 
                 buf.mark_idle()
 
                 if not alive:
-                    # Final drain of activity log, then stop
-                    if log_fd is not None:
-                        try:
-                            tail = log_fd.read()
-                        except Exception:
-                            tail = b""
-                        if tail:
-                            scorer = self._health_scorers.get(session_id)
-                            if scorer:
-                                scorer.record_output(len(tail))
+                    self._drain_activity(session_id, log_fd)  # final drain
                     break
 
+                tick += 1
                 await asyncio.sleep(0.2)
         finally:
             if log_fd is not None:
                 try:
                     log_fd.close()
-                except Exception:
-                    pass
+                except OSError as e:
+                    logger.debug("activity log close failed for %s: %s", session_id, e)
 
-    async def _capture(self, session_id: str) -> tuple[str | None, str | None, str | None]:
-        """Return (plain_viewport, ansi_viewport, ansi_history) via capture-pane."""
-        rc1, plain_b, _ = await _tmux("capture-pane", "-t", session_id, "-p")
-        if rc1 != 0:
-            return None, None, None
-        rc2, ansi_b, _ = await _tmux("capture-pane", "-t", session_id, "-e", "-p")
-        rc3, hist_b, _ = await _tmux(
+    async def _capture(
+        self, session_id: str, *, with_history: bool = True
+    ) -> tuple[str, str | None] | None:
+        """Snapshot the pane. Returns (ansi_viewport, ansi_history) or None if gone.
+
+        A `None` history means "unchanged, keep what you have" — scrollback is
+        only re-read every few ticks because it costs a 5000-line capture and
+        only changes when lines scroll off the pane.
+
+        Plain text is derived from the ANSI capture by the caller rather than
+        fetched separately: it saves a fork per tick, and it guarantees the plain
+        and styled views describe the same instant (two captures could not).
+        """
+        rc, ansi_b, _ = await _tmux("capture-pane", "-t", session_id, "-e", "-p")
+        if rc != 0:
+            return None
+        viewport_ansi = ansi_b.decode("utf-8", errors="replace")
+        if not with_history:
+            return viewport_ansi, None
+        rc_hist, hist_b, _ = await _tmux(
             "capture-pane", "-t", session_id, "-e", "-p", "-S", "-5000", "-E", "-1",
         )
-        plain = plain_b.decode("utf-8", errors="replace")
-        viewport_ansi = ansi_b.decode("utf-8", errors="replace") if rc2 == 0 else plain
-        history_ansi = hist_b.decode("utf-8", errors="replace") if rc3 == 0 else ""
-        return plain, viewport_ansi, history_ansi
+        history_ansi = hist_b.decode("utf-8", errors="replace") if rc_hist == 0 else ""
+        return viewport_ansi, history_ansi
 
 
 
@@ -713,7 +850,16 @@ class ApiBackend:
         self._running: dict[str, asyncio.Task[None]] = {}
         self._buffers: dict[str, OutputBuffer] = {}
 
-    async def start(self, config: AgentConfig, task: Task, prompt: str, cwd: Path, stage: str = "", cli_flags: str = "") -> str:
+    async def start(
+        self,
+        config: AgentConfig,
+        task: Task,
+        prompt: str,
+        cwd: Path,
+        stage: str = "",
+        cli_flags: str = "",
+        terminal_size: tuple[int, int] | None = None,
+    ) -> str:
         session_id = f"api_{task.id}_{stage or task.status.value}"
 
         # Stop old session if same ID exists
@@ -753,10 +899,10 @@ class ApiBackend:
             max_tokens=4096,
             messages=[{"role": "user", "content": prompt}],
         )
-        # Handle different content block types
+        # Content is a list of blocks; only text blocks carry a response.
         for block in msg.content:
             if hasattr(block, "text"):
-                return block.text
+                return str(block.text)
         return ""
 
     async def _run_openai(self, config: AgentConfig, prompt: str) -> str:
@@ -808,6 +954,9 @@ class ApiBackend:
         task = self._running.get(session_id)
         return task is not None and not task.done()
 
+    def has_session(self, session_id: str) -> bool:
+        return session_id in self._running
+
     def health(self, session_id: str) -> AgentHealth | None:
         """Static health for API backend: 75 if alive, 0 if dead."""
         alive = self.is_alive(session_id)
@@ -824,6 +973,29 @@ class ApiBackend:
         """List all active session IDs."""
         return list(self._running.keys())
 
+    # --- Terminal-only protocol members ---
+    # API sessions have no PTY: there is nothing to style, scroll, resize, or
+    # watch for prompts. These return inert values so callers can treat every
+    # backend uniformly instead of probing for capabilities.
+
+    async def get_output_rich(self, session_id: str) -> Text | None:
+        return None
+
+    async def get_history_rich(self, session_id: str) -> list[Text]:
+        return []
+
+    def is_stage_complete(self, session_id: str) -> bool:
+        return False
+
+    def is_waiting_for_input(self, session_id: str) -> bool:
+        return False
+
+    def status_data(self, session_id: str) -> dict[str, Any] | None:
+        return None
+
+    def resize_session(self, session_id: str, cols: int, rows: int) -> None:
+        return None
+
 
 # --- Process Manager (crash cleanup) ---
 
@@ -832,17 +1004,17 @@ class _ProcessManager:
     """Track tmux session names for clean shutdown on crash/signal."""
 
     def __init__(self) -> None:
-        self._sessions: dict[str, str] = {}  # session_id -> tmux session name
+        self._sessions: set[str] = set()
 
-    def register(self, session_id: str, tmux_name: str) -> None:
-        self._sessions[session_id] = tmux_name
+    def register(self, session_id: str) -> None:
+        self._sessions.add(session_id)
 
     def unregister(self, session_id: str) -> None:
-        self._sessions.pop(session_id, None)
+        self._sessions.discard(session_id)
 
     def cleanup_all(self) -> None:
         """Kill all tracked tmux sessions. Safe to call from atexit."""
-        for _sid, name in list(self._sessions.items()):
+        for name in list(self._sessions):
             _tmux_sync("kill-session", "-t", name)
         self._sessions.clear()
 
@@ -934,9 +1106,9 @@ class AgentRegistry:
 
     async def stop_session(self, session_id: str) -> None:
         """Stop a specific session, routing to the correct backend."""
-        if session_id in self._pty._sessions:
+        if self._pty.has_session(session_id):
             await self._pty.stop(session_id)
-        elif session_id in self._api._running:
+        elif self._api.has_session(session_id):
             await self._api.stop(session_id)
 
     async def cleanup_all(self) -> None:
@@ -987,7 +1159,6 @@ class AgentRegistry:
 
         reattached = 0
         orphans: list[str] = []
-        cleared = False
 
         for name in live_names:
             task = tasks_by_session.get(name)
@@ -1003,10 +1174,5 @@ class AgentRegistry:
             if task.session_id and task.session_id not in live_set:
                 task.session_id = None
                 storage.save_task(task)
-                cleared = True
-
-        if cleared:
-            # save_task already persisted; no-op marker for callers that care
-            pass
 
         return reattached, orphans

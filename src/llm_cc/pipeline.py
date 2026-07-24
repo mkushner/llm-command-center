@@ -3,18 +3,32 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from pathlib import Path
 
-from .agents import AgentRegistry
+from .agents import STAGE_COMPLETE_MARKER, AgentRegistry
 from .git import GitWorkspace
+from .log import logger
 from .models import (
     STAGE_ORDER,
+    AgentConfig,
     GitMode,
     MergedConfig,
+    PipelineStage,
     Task,
     TaskStatus,
 )
 from .storage import Storage
+
+# Stages that run an agent, and can therefore be restarted.
+_AGENT_STAGES = (TaskStatus.PLANNING, TaskStatus.EXECUTE, TaskStatus.REVIEW)
+
+# How we ask an agent to declare a stage finished. Detection is whole-line
+# (see `agents.STAGE_COMPLETE_MARKER`), so this line must keep text alongside the
+# marker — that is precisely what stops our own instruction from being read back
+# as a completion. Keep it short so a narrow pane can't wrap the marker onto a
+# line by itself.
+_DONE_INSTRUCTION = f"When done, output: {STAGE_COMPLETE_MARKER}"
 
 
 async def _compress_log(log_text: str, task_title: str, stage: str) -> str:
@@ -52,7 +66,7 @@ async def _compress_log(log_text: str, task_title: str, stage: str) -> str:
     )
     for block in msg.content:
         if hasattr(block, "text"):
-            return block.text
+            return str(block.text)
     return ""
 
 
@@ -73,14 +87,25 @@ class PipelineEngine:
         # Parked brainstorm sessions: task_id → {sub_agent_idx: session_id}
         self._brainstorm_sessions: dict[str, dict[int, str]] = {}
 
-    def _agent_config_for_stage(self, status: TaskStatus, task: Task):
+    @staticmethod
+    def _merge_stage_tools(
+        agent_config: AgentConfig, stage: PipelineStage | None
+    ) -> AgentConfig:
+        """Layer a stage's extra allowed_tools onto the agent's own.
+
+        Accumulates rather than replaces, and preserves order while dropping
+        duplicates — same contract as `storage._merge_agents`.
+        """
+        if not stage or not stage.allowed_tools:
+            return agent_config
+        merged = list(dict.fromkeys(agent_config.allowed_tools + stage.allowed_tools))
+        return agent_config.model_copy(update={"allowed_tools": merged})
+
+    def _agent_config_for_stage(self, status: TaskStatus, task: Task) -> AgentConfig:
         """Resolve agent config with per-stage allowed_tools merged in."""
-        agent_config = self.config.agent_for_stage(status, task)
-        stage = self.config.stage_config(status)
-        if stage and stage.allowed_tools:
-            merged_tools = list(dict.fromkeys(agent_config.allowed_tools + stage.allowed_tools))
-            agent_config = agent_config.model_copy(update={"allowed_tools": merged_tools})
-        return agent_config
+        return self._merge_stage_tools(
+            self.config.agent_for_stage(status, task), self.config.stage_config(status)
+        )
 
     def _task_cwd(self, task: Task) -> Path:
         """Working directory for agent: worktree path if available, else project root."""
@@ -182,8 +207,10 @@ class PipelineEngine:
             return False
 
         # Same effective mode
-        current_mode = (current_stage.mode_override if current_stage else None) or current_agent.mode
-        next_mode = (next_stage.mode_override if next_stage else None) or next_agent.mode
+        cur_override = current_stage.mode_override if current_stage else None
+        nxt_override = next_stage.mode_override if next_stage else None
+        current_mode = cur_override or current_agent.mode
+        next_mode = nxt_override or next_agent.mode
         if current_mode != next_mode:
             return False
 
@@ -231,7 +258,7 @@ class PipelineEngine:
                     lines.append(f"Verify: {task.verify}")
                 if task.done:
                     lines.append(f"Done when: {task.done}")
-                lines.extend(["", "When finished, say: EXECUTE COMPLETE"])
+                lines.extend(["", _DONE_INSTRUCTION])
 
             case TaskStatus.REVIEW:
                 lines = [
@@ -244,15 +271,59 @@ class PipelineEngine:
                     lines.append(f"Verify: {task.verify}")
                 if task.done:
                     lines.append(f"Done when: {task.done}")
-                lines.extend(["", "When finished, say: REVIEW COMPLETE"])
+                lines.extend(["", _DONE_INSTRUCTION])
 
             case _:
                 lines = [
                     f"{next_status.value.upper()}: {task.title}",
-                    f"When finished, say: {next_status.value.upper()} COMPLETE",
+                    _DONE_INSTRUCTION,
                 ]
 
         return "\n".join(lines)
+
+    def _require_execute_slot(self, task: Task) -> None:
+        """Guard the single EXECUTE slot when nothing isolates the working tree.
+
+        Worktree mode gives every task its own directory, so concurrent execution
+        is fine there; NONE and BRANCH share one checkout and must not overlap.
+        """
+        if self.config.project.git.mode not in (GitMode.NONE, GitMode.BRANCH):
+            return
+        store = self.storage.load_tasks()
+        occupied = [t for t in store.by_status(TaskStatus.EXECUTE) if t.id != task.id]
+        if occupied:
+            raise RuntimeError(f"Execute slot occupied by: {occupied[0].title}")
+
+    async def _start_stage_agent(
+        self, task: Task, status: TaskStatus, docs: Path, extra_context: str = ""
+    ) -> None:
+        """Spawn the single agent for `status` and record its session on the task."""
+        stage = self.config.stage_config(status)
+        agent_config = self._agent_config_for_stage(status, task)
+        backend = self.agents.backend_for(
+            agent_config.name, stage.mode_override if stage else None
+        )
+        plan_path = self._resolve_plan_path(task)
+        prompt = self._build_stage_prompt(task, status, docs, plan_path) + extra_context
+        task.session_id = await backend.start(
+            agent_config,
+            task,
+            prompt,
+            self._task_cwd(task),
+            stage=status.value,
+            cli_flags=stage.effective_cli_flags if stage else "",
+        )
+
+    async def _enter_stage(self, task: Task, status: TaskStatus, docs: Path) -> None:
+        """Start whatever `status` requires: a brainstorm cycle or a single agent."""
+        stage = self.config.stage_config(status)
+        if stage and stage.is_brainstorm:
+            task.sub_agent_idx = 0
+            task.loop_count = 0
+            task.brainstorm_summarizing = False
+            await self._spawn_brainstorm_agent(task, stage, docs)
+        else:
+            await self._start_stage_agent(task, status, docs)
 
     async def advance(self, task: Task) -> Task:
         """Move task to next stage. Orchestrates agents and git."""
@@ -271,18 +342,11 @@ class PipelineEngine:
             if not can_resume:
                 await self._stop_current_agent(task)
 
-        if can_resume:
+        if can_resume and prev_session_id:
             # Resume existing session with slim prompt — session_id stays the same
             docs = self._ensure_task_docs(task)
-
-            # Execute slot check still needed
             if next_status == TaskStatus.EXECUTE:
-                if self.config.project.git.mode in (GitMode.NONE, GitMode.BRANCH):
-                    store = self.storage.load_tasks()
-                    occupied = [t for t in store.by_status(TaskStatus.EXECUTE) if t.id != task.id]
-                    if occupied:
-                        raise RuntimeError(f"Execute slot occupied by: {occupied[0].title}")
-
+                self._require_execute_slot(task)
             prompt = self._build_resume_prompt(task, next_status, docs)
             stage_cfg = self.config.stage_config(next_status)
             agent_config = self.config.agent_for_stage(next_status, task)
@@ -290,48 +354,21 @@ class PipelineEngine:
                 agent_config.name,
                 stage_cfg.mode_override if stage_cfg else None,
             )
-            await backend.resume(task.session_id, prompt)
+            await backend.resume(prev_session_id, prompt)
         else:
             # Normal flow: stop was already done above, start new agent
-            stage = self.config.stage_config(next_status)
-            agent_config = self._agent_config_for_stage(next_status, task)
-            flags = stage.effective_cli_flags if stage else ""
             docs = self._ensure_task_docs(task)
 
             match next_status:
                 case TaskStatus.PLANNING:
                     await self.git.setup(task)  # sets task.branch_name
-                    if stage and stage.is_brainstorm:
-                        task.sub_agent_idx = 0
-                        task.loop_count = 0
-                        task.brainstorm_summarizing = False
-                        await self._spawn_brainstorm_agent(task, stage, docs)
-                    else:
-                        plan_path = self._resolve_plan_path(task)
-                        prompt = self._build_planning_prompt(task, docs, plan_path)
-                        backend = self.agents.backend_for(agent_config.name, stage.mode_override if stage else None)
-                        task.session_id = await backend.start(agent_config, task, prompt, self._task_cwd(task), stage="planning", cli_flags=flags)
+                    await self._enter_stage(task, next_status, docs)
 
                 case TaskStatus.EXECUTE:
-                    # No directory isolation — only one task in Execute at a time
-                    if self.config.project.git.mode in (GitMode.NONE, GitMode.BRANCH):
-                        store = self.storage.load_tasks()
-                        occupied = [t for t in store.by_status(TaskStatus.EXECUTE) if t.id != task.id]
-                        if occupied:
-                            raise RuntimeError(f"Execute slot occupied by: {occupied[0].title}")
-
+                    self._require_execute_slot(task)
                     if not self._has_planning_stage():
                         await self.git.setup(task)  # git setup here when no planning stage
-                    if stage and stage.is_brainstorm:
-                        task.sub_agent_idx = 0
-                        task.loop_count = 0
-                        task.brainstorm_summarizing = False
-                        await self._spawn_brainstorm_agent(task, stage, docs)
-                    else:
-                        plan_path = self._resolve_plan_path(task)
-                        prompt = self._build_execute_prompt(task, docs, plan_path)
-                        backend = self.agents.backend_for(agent_config.name, stage.mode_override if stage else None)
-                        task.session_id = await backend.start(agent_config, task, prompt, self._task_cwd(task), stage="execute", cli_flags=flags)
+                    await self._enter_stage(task, next_status, docs)
 
                 case TaskStatus.REVIEW:
                     # Compress execute log for review context
@@ -339,16 +376,7 @@ class PipelineEngine:
                         await self._compress_session_for_next(
                             task, prev_session_id, "execute-summary.md",
                         )
-                    if stage and stage.is_brainstorm:
-                        task.sub_agent_idx = 0
-                        task.loop_count = 0
-                        task.brainstorm_summarizing = False
-                        await self._spawn_brainstorm_agent(task, stage, docs)
-                    else:
-                        plan_path = self._resolve_plan_path(task)
-                        prompt = self._build_review_prompt(task, docs, plan_path)
-                        backend = self.agents.backend_for(agent_config.name, stage.mode_override if stage else None)
-                        task.session_id = await backend.start(agent_config, task, prompt, self._task_cwd(task), stage="review", cli_flags=flags)
+                    await self._enter_stage(task, next_status, docs)
 
                 case TaskStatus.DONE:
                     task.session_id = None
@@ -383,9 +411,20 @@ class PipelineEngine:
         self.storage.save_task(task)
         return task
 
+    async def _respawn(self, task: Task, docs: Path, extra_context: str) -> Task:
+        """Start a fresh agent for the task's *current* stage, and persist.
+
+        Shared tail of `restart` and `context_restart`; they differ only in what
+        continuity they append to the prompt.
+        """
+        await self._start_stage_agent(task, task.status, docs, extra_context)
+        task.touch()
+        self.storage.save_task(task)
+        return task
+
     async def restart(self, task: Task) -> Task:
         """Re-run the current stage's agent."""
-        if task.status not in (TaskStatus.PLANNING, TaskStatus.EXECUTE, TaskStatus.REVIEW):
+        if task.status not in _AGENT_STAGES:
             return task  # BACKLOG/DONE — nothing to restart
 
         # Stop current agent if running
@@ -393,35 +432,17 @@ class PipelineEngine:
             await self._stop_current_agent(task)
 
         docs = self._ensure_task_docs(task)
-        plan_path = self._resolve_plan_path(task)
-        stage = self.config.stage_config(task.status)
-        agent_config = self._agent_config_for_stage(task.status, task)
-        backend = self.agents.backend_for(agent_config.name, stage.mode_override if stage else None)
-        flags = stage.effective_cli_flags if stage else ""
-
-        match task.status:
-            case TaskStatus.PLANNING:
-                prompt = self._build_planning_prompt(task, docs, plan_path)
-            case TaskStatus.EXECUTE:
-                prompt = self._build_execute_prompt(task, docs, plan_path)
-            case TaskStatus.REVIEW:
-                prompt = self._build_review_prompt(task, docs, plan_path)
 
         # Include handoff context if available from previous run
-        handoff_path = docs / "handoff.md"
-        if handoff_path.exists():
+        extra = ""
+        if (docs / "handoff.md").exists():
             docs_rel = self._docs_path_for_prompt(docs, task)
-            prompt += f"\n\nPrevious session handoff: {docs_rel}/handoff.md"
-
-        task.session_id = await backend.start(agent_config, task, prompt, self._task_cwd(task), stage=task.status.value, cli_flags=flags)
-
-        task.touch()
-        self.storage.save_task(task)
-        return task
+            extra = f"\n\nPrevious session handoff: {docs_rel}/handoff.md"
+        return await self._respawn(task, docs, extra)
 
     def needs_restart(self, task: Task) -> bool:
         """True if task is in an active stage but has no living agent."""
-        if task.status not in (TaskStatus.PLANNING, TaskStatus.EXECUTE, TaskStatus.REVIEW):
+        if task.status not in _AGENT_STAGES:
             return False
         if not task.session_id:
             return True
@@ -439,20 +460,20 @@ class PipelineEngine:
         # Generate handoff before stopping
         if self.agents.session_store:
             ctx = self.agents.session_store.get(task.session_id)
-            if ctx and hasattr(ctx, "generate_handoff"):
+            if ctx:
                 try:
                     handoff = ctx.generate_handoff(task.title, task.verify, task.done)
-                    if isinstance(handoff, str):
-                        docs = self._task_docs_dir(task)
-                        (docs / "handoff.md").write_text(handoff)
-                except Exception:
-                    pass
+                    (self._task_docs_dir(task) / "handoff.md").write_text(handoff)
+                except OSError as e:
+                    logger.warning("handoff write failed for %s: %s", task.id, e)
         try:
             agent_config = self.config.agent_for_stage(task.status, task)
             backend = self.agents.backend_for(agent_config.name)
             await backend.stop(task.session_id)
-        except Exception:
-            pass
+        except (KeyError, OSError, RuntimeError) as e:
+            # Session is dropped either way — the task must not stay pinned to a
+            # session we failed to kill.
+            logger.warning("stopping agent for %s failed: %s", task.id, e)
         task.session_id = None
 
     async def _save_stage_output(self, task: Task, stage_name: str) -> None:
@@ -469,8 +490,8 @@ class PipelineEngine:
                 docs = self._task_docs_dir(task)
                 out_file = docs / f"{stage_name}-output.md"
                 out_file.write_text(output)
-        except Exception:
-            pass
+        except (TimeoutError, KeyError, OSError) as e:
+            logger.warning("could not save %s output for %s: %s", stage_name, task.id, e)
 
     # --- Context Compression ---
 
@@ -489,60 +510,34 @@ class PipelineEngine:
             if summary:
                 docs = self._task_docs_dir(task)
                 (docs / out_name).write_text(summary)
-        except Exception:
-            pass
+        except Exception as e:
+            # Compression is an API call — anything from network errors to auth
+            # failures. Best-effort by design: the stage proceeds without it.
+            logger.warning("context compression to %s failed for %s: %s", out_name, task.id, e)
 
     async def context_restart(self, task: Task) -> Task:
         """Restart agent due to context pressure, with compressed session summary."""
-        if task.status not in (TaskStatus.PLANNING, TaskStatus.EXECUTE, TaskStatus.REVIEW):
+        if task.status not in _AGENT_STAGES:
             return task
 
         session_id = task.session_id
-        if task.session_id:
+        if session_id:
             await self._stop_current_agent(task)
 
         docs = self._ensure_task_docs(task)
 
         # Compress log for continuity
         if session_id:
-            await self._compress_session_for_next(
-                task, session_id, "context-summary.md",
-            )
+            await self._compress_session_for_next(task, session_id, "context-summary.md")
 
-        plan_path = self._resolve_plan_path(task)
-        stage = self.config.stage_config(task.status)
-        agent_config = self._agent_config_for_stage(task.status, task)
-        backend = self.agents.backend_for(
-            agent_config.name, stage.mode_override if stage else None,
-        )
-        flags = stage.effective_cli_flags if stage else ""
-
-        match task.status:
-            case TaskStatus.PLANNING:
-                prompt = self._build_planning_prompt(task, docs, plan_path)
-            case TaskStatus.EXECUTE:
-                prompt = self._build_execute_prompt(task, docs, plan_path)
-            case TaskStatus.REVIEW:
-                prompt = self._build_review_prompt(task, docs, plan_path)
-
-        # Append context references
         docs_rel = self._docs_path_for_prompt(docs, task)
-        handoff_path = docs / "handoff.md"
-        summary_path = docs / "context-summary.md"
-        if summary_path.exists():
-            prompt += f"\n\nContext summary from previous session: {docs_rel}/context-summary.md"
-        if handoff_path.exists():
-            prompt += f"\nSession handoff: {docs_rel}/handoff.md"
-        prompt += "\n\nRead the context summary first to continue where you left off."
-
-        task.session_id = await backend.start(
-            agent_config, task, prompt, self._task_cwd(task),
-            stage=task.status.value, cli_flags=flags,
-        )
-
-        task.touch()
-        self.storage.save_task(task)
-        return task
+        extra = ""
+        if (docs / "context-summary.md").exists():
+            extra += f"\n\nContext summary from previous session: {docs_rel}/context-summary.md"
+        if (docs / "handoff.md").exists():
+            extra += f"\nSession handoff: {docs_rel}/handoff.md"
+        extra += "\n\nRead the context summary first to continue where you left off."
+        return await self._respawn(task, docs, extra)
 
     # --- Brainstorm ---
 
@@ -608,13 +603,12 @@ class PipelineEngine:
         self.storage.save_task(task)
         return False
 
-    async def _spawn_brainstorm_agent(self, task: Task, stage, docs: Path) -> None:
+    async def _spawn_brainstorm_agent(
+        self, task: Task, stage: PipelineStage, docs: Path
+    ) -> None:
         """Spawn the current brainstorm sub-agent, resuming a parked session if available."""
         agent_name = stage.agent_at(task.sub_agent_idx)
-        agent_config = self.config.agents[agent_name]
-        if stage.allowed_tools:
-            merged = list(dict.fromkeys(agent_config.allowed_tools + stage.allowed_tools))
-            agent_config = agent_config.model_copy(update={"allowed_tools": merged})
+        agent_config = self._merge_stage_tools(self.config.agents[agent_name], stage)
         backend = self.agents.backend_for(agent_config.name, stage.mode_override)
 
         # Check for parked session from a previous cycle
@@ -659,8 +653,8 @@ class PipelineEngine:
             )
             if output:
                 out_file.write_text(output)
-        except Exception:
-            pass
+        except (TimeoutError, KeyError, OSError) as e:
+            logger.warning("could not save brainstorm output for %s: %s", task.id, e)
 
     def _park_brainstorm_session(self, task: Task) -> None:
         """Park the current brainstorm session instead of killing it."""
@@ -677,8 +671,8 @@ class PipelineEngine:
         for session_id in sessions.values():
             try:
                 await self.agents.stop_session(session_id)
-            except Exception:
-                pass
+            except (KeyError, OSError, RuntimeError) as e:
+                logger.warning("could not stop parked session %s: %s", session_id, e)
 
     async def cleanup_task(self, task: Task) -> None:
         """Clean up all sessions for a task (on delete or full stop)."""
@@ -687,7 +681,7 @@ class PipelineEngine:
         await self._stop_all_brainstorm_sessions(task.id)
 
     def _build_brainstorm_resume_prompt(
-        self, task: Task, agent_name: str, stage, docs: Path,
+        self, task: Task, agent_name: str, stage: PipelineStage, docs: Path,
     ) -> str:
         """Build a slim resume prompt for a parked brainstorm agent.
 
@@ -726,13 +720,10 @@ class PipelineEngine:
 
         return "\n".join(lines)
 
-    async def _spawn_brainstorm_summarizer(self, task: Task, stage) -> None:
+    async def _spawn_brainstorm_summarizer(self, task: Task, stage: PipelineStage) -> None:
         """Spawn the summarizer agent after all brainstorm loops."""
         task.brainstorm_summarizing = True
-        agent_config = self.config.agents[stage.summarizer]
-        if stage.allowed_tools:
-            merged = list(dict.fromkeys(agent_config.allowed_tools + stage.allowed_tools))
-            agent_config = agent_config.model_copy(update={"allowed_tools": merged})
+        agent_config = self._merge_stage_tools(self.config.agents[stage.summarizer], stage)
         docs = self._task_docs_dir(task)
         summary_dir = self.git.project_path / "brainstorm" / task.id
         summary_dir.mkdir(parents=True, exist_ok=True)
@@ -744,7 +735,9 @@ class PipelineEngine:
             stage=session_stage, cli_flags=stage.effective_cli_flags,
         )
 
-    def _build_summary_prompt(self, task: Task, stage, docs: Path, summary_dir: Path) -> str:
+    def _build_summary_prompt(
+        self, task: Task, stage: PipelineStage, docs: Path, summary_dir: Path
+    ) -> str:
         """Build prompt for the brainstorm summarizer."""
         docs_rel = self._docs_path_for_prompt(docs, task)
         if self._in_worktree(task):
@@ -786,7 +779,9 @@ class PipelineEngine:
 
         return "\n".join(lines)
 
-    def _build_brainstorm_prompt(self, task: Task, agent_name: str, stage, docs: Path) -> str:
+    def _build_brainstorm_prompt(
+        self, task: Task, agent_name: str, stage: PipelineStage, docs: Path
+    ) -> str:
         """Build prompt for a brainstorm sub-agent with cycle context."""
         docs_rel = self._docs_path_for_prompt(docs, task)
         cycle = task.loop_count + 1  # 1-based for display
@@ -819,7 +814,9 @@ class PipelineEngine:
         out_file = f"{docs_rel}/{agent_name}-cycle{cycle}.md"
         lines.append("")
         lines.append(f"Write your analysis to: {out_file}")
-        lines.append("Do NOT use Read tool on previous output files — use cat or just reference them.")
+        lines.append(
+            "Do NOT use Read tool on previous output files — use cat or just reference them."
+        )
         return "\n".join(lines)
 
     # --- Prompt Building ---
@@ -845,6 +842,20 @@ class PipelineEngine:
             return str(docs)
         return str(docs.relative_to(self.git.project_path))
 
+    def _build_stage_prompt(
+        self, task: Task, status: TaskStatus, docs: Path, plan_path: Path
+    ) -> str:
+        """Dispatch to the prompt builder for an agent stage.
+
+        Only ever called for `_AGENT_STAGES`; callers guard on that.
+        """
+        builders: dict[TaskStatus, Callable[[Task, Path, Path], str]] = {
+            TaskStatus.PLANNING: self._build_planning_prompt,
+            TaskStatus.EXECUTE: self._build_execute_prompt,
+            TaskStatus.REVIEW: self._build_review_prompt,
+        }
+        return builders[status](task, docs, plan_path)
+
     def _build_planning_prompt(self, task: Task, docs: Path, plan_path: Path) -> str:
         docs_rel = self._docs_path_for_prompt(docs, task)
         plan_rel = self._plan_path_for_prompt(plan_path, task)
@@ -852,7 +863,7 @@ class PipelineEngine:
             f"PLANNING: {task.title}\n\n"
             f"Task description: {docs_rel}/task.md\n"
             f"Write your plan to: {plan_rel}\n\n"
-            f"When finished, say: PLANNING COMPLETE"
+            f"{_DONE_INSTRUCTION}"
         )
 
     def _build_execute_prompt(self, task: Task, docs: Path, plan_path: Path) -> str:
@@ -868,7 +879,7 @@ class PipelineEngine:
             lines.append(f"Verify: {task.verify}")
         if task.done:
             lines.append(f"Done when: {task.done}")
-        lines.extend(["", "When finished, say: EXECUTE COMPLETE"])
+        lines.extend(["", _DONE_INSTRUCTION])
         return "\n".join(lines)
 
     def _build_review_prompt(self, task: Task, docs: Path, plan_path: Path) -> str:
@@ -898,7 +909,7 @@ class PipelineEngine:
             lines.append(f"Verify: {task.verify}")
         if task.done:
             lines.append(f"Done when: {task.done}")
-        lines.extend(["", "When finished, say: REVIEW COMPLETE"])
+        lines.extend(["", _DONE_INSTRUCTION])
         return "\n".join(lines)
 
     def _has_planning_stage(self) -> bool:
@@ -909,7 +920,9 @@ class PipelineEngine:
 
     def _is_active(self, status: TaskStatus) -> bool:
         """True if this stage is in the pipeline (or is BACKLOG/DONE)."""
-        return status in (TaskStatus.BACKLOG, TaskStatus.DONE) or status in self._configured_stages()
+        if status in (TaskStatus.BACKLOG, TaskStatus.DONE):
+            return True
+        return status in self._configured_stages()
 
     def _next_status(self, current: TaskStatus) -> TaskStatus | None:
         """Next stage, skipping stages not in [[pipeline]] config.

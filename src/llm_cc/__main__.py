@@ -6,6 +6,10 @@ import shutil
 import sys
 import tomllib
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from llm_cc.storage import Storage
 
 
 def _require_tmux() -> None:
@@ -19,7 +23,7 @@ def _require_tmux() -> None:
         sys.exit(1)
 
 
-def _import_tasks(storage: object, tasks_path: Path) -> int:
+def _import_tasks(storage: Storage, tasks_path: Path) -> int:
     """Import tasks from a TOML file into BACKLOG. Returns count of imported tasks."""
     from llm_cc.models import Task
 
@@ -142,6 +146,11 @@ def main() -> None:
     storage.ensure_dirs()
     storage.ensure_gitignore()
     storage.update_recent_projects(str(project_path))
+
+    # Best-effort paths log here instead of failing silently.
+    from llm_cc.log import setup as setup_logging
+
+    setup_logging(project_path)
 
     # Auto-permissions setup (idempotent, silent after first run)
     from llm_cc.permissions import ensure_global_claude_default_mode, ensure_global_gitignore

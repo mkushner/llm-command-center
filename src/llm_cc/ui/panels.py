@@ -3,21 +3,26 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
 import time
-from typing import TYPE_CHECKING
+from typing import Any
 
+from rich.syntax import Syntax
+from rich.text import Text
 from textual import on
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical, VerticalScroll
+from textual.events import Key, Resize
 from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Label, Static, TextArea
+from textual.widgets.button import ButtonVariant
 
+from llm_cc.agents import AgentBackend, sanitize_session_name
+from llm_cc.health import context_color
+from llm_cc.log import logger
 from llm_cc.models import Task
-
-if TYPE_CHECKING:
-    from rich.text import Text
 
 
 class TaskInputDialog(ModalScreen[Task | None]):
@@ -246,7 +251,9 @@ class ConfirmDialog(ModalScreen[bool]):
         with Vertical(id="confirm-container", classes=f"-{self._severity}"):
             yield Static(self._prompt)
             with Horizontal(id="confirm-buttons"):
-                btn_variant = "error" if self._severity == "danger" else "warning"
+                btn_variant: ButtonVariant = (
+                    "error" if self._severity == "danger" else "warning"
+                )
                 yield Button("Yes", variant=btn_variant, id="confirm-yes")
                 yield Button("No", variant="default", id="confirm-no")
 
@@ -274,7 +281,7 @@ class ConfirmDialog(ModalScreen[bool]):
 _SCROLLBACK_ROWS = 500
 
 
-def _collapse_blank_runs(text: "Text", keep: int = 2) -> "Text":
+def _collapse_blank_runs(text: Text, keep: int = 2) -> Text:
     """Collapse runs of more than `keep` blank lines down to `keep`.
 
     A tall capture frame leaves a large blank gap between the top-anchored
@@ -282,8 +289,6 @@ def _collapse_blank_runs(text: "Text", keep: int = 2) -> "Text":
     the last row). Collapsing that gap keeps scrolling usable without dropping
     any real output.
     """
-    from rich.text import Text
-
     out: list[Text] = []
     blanks = 0
     for line in text.split("\n"):
@@ -325,7 +330,7 @@ class AgentPanelView(Container):
     def __init__(
         self,
         session_id: str,
-        backend: object,
+        backend: AgentBackend,
         *,
         title: str = "",
         agent: str = "",
@@ -344,6 +349,9 @@ class AgentPanelView(Container):
         self._follow_tail = True
         self._glyph_cache: str = ""
         self._glyph_at: float = 0.0
+        # Last content actually rendered, kept to skip redundant redraws.
+        self._last_viewport: Text | None = None
+        self._last_history: list[Text] | None = None
 
     def _titlebar_text(self) -> str:
         parts: list[str] = []
@@ -409,22 +417,22 @@ class AgentPanelView(Container):
     def on_unmount(self) -> None:
         self._polling = False
 
-    def on_resize(self, event) -> None:
+    def on_resize(self, event: Resize) -> None:
         self._resize_pty()
 
     def _resize_pty(self) -> None:
         try:
             scroll = self.query_one(".agent-scroll", VerticalScroll)
-            cols = scroll.size.width - 2
-            # Height is decoupled from the widget: a tall pane is the only way to
-            # keep scrollback for alt-screen agents. The VerticalScroll scrolls it.
-            rows = max(scroll.size.height, _SCROLLBACK_ROWS)
-            if cols > 0 and rows > 0 and hasattr(self._backend, "resize_session"):
-                self._backend.resize_session(self._session_id, cols, rows)
         except Exception:
-            pass
+            return  # widget not mounted yet
+        cols = scroll.size.width - 2
+        # Height is decoupled from the widget: a tall pane is the only way to
+        # keep scrollback for alt-screen agents. The VerticalScroll scrolls it.
+        rows = max(scroll.size.height, _SCROLLBACK_ROWS)
+        if cols > 0 and rows > 0:
+            self._backend.resize_session(self._session_id, cols, rows)
 
-    async def on_key(self, event) -> None:
+    async def on_key(self, event: Key) -> None:
         if self._input_mode:
             if event.key == "escape":
                 self._input_mode = False
@@ -464,35 +472,27 @@ class AgentPanelView(Container):
 
         if event.key == "ctrl+v":
             try:
-                import subprocess
                 clip = subprocess.run(
                     ["pbpaste"], capture_output=True, text=True, timeout=2
                 )
                 if clip.returncode == 0 and clip.stdout:
                     await self._send_raw(clip.stdout)
-            except Exception:
-                pass
+            except (OSError, subprocess.SubprocessError) as e:
+                logger.debug("paste failed: %s", e)
             event.prevent_default()
             event.stop()
             return
 
         if event.key == "ctrl+y":
             try:
-                import subprocess
-                text = ""
-                if hasattr(self._backend, "get_output"):
-                    text = await self._backend.get_output(self._session_id) or ""
-                if text:
-                    proc = subprocess.run(
-                        ["pbcopy"], input=text, text=True, timeout=2
-                    )
-                    if proc.returncode == 0:
-                        self.app.notify("Copied agent output to clipboard")
-                    else:
-                        self.app.notify("Copy failed", severity="warning")
-                else:
+                text = await self._backend.get_output(self._session_id) or ""
+                if not text:
                     self.app.notify("No output to copy", severity="warning")
-            except Exception as e:
+                elif subprocess.run(["pbcopy"], input=text, text=True, timeout=2).returncode:
+                    self.app.notify("Copy failed", severity="warning")
+                else:
+                    self.app.notify("Copied agent output to clipboard")
+            except (OSError, subprocess.SubprocessError) as e:
                 self.app.notify(f"Copy error: {e}", severity="error")
             event.prevent_default()
             event.stop()
@@ -528,8 +528,7 @@ class AgentPanelView(Container):
             event.stop()
 
     async def _send_raw(self, data: str) -> None:
-        if hasattr(self._backend, "send_raw"):
-            await self._backend.send_raw(self._session_id, data)
+        await self._backend.send_raw(self._session_id, data)
 
     def _update_pause_chip(self) -> None:
         try:
@@ -546,26 +545,11 @@ class AgentPanelView(Container):
         now = time.monotonic()
         if now - self._glyph_at < 1.0:
             return self._glyph_cache
-        backend = self._backend
-        if not hasattr(backend, "is_alive"):
-            self._glyph_cache = ""
-            self._glyph_at = now
-            return self._glyph_cache
-        try:
-            alive = backend.is_alive(self._session_id)
-        except Exception:
-            alive = False
-        if not alive:
+        if not self._backend.is_alive(self._session_id):
             glyph = "[#f87171]✕[/]"
         else:
-            score: int | None = None
-            if hasattr(backend, "health"):
-                try:
-                    h = backend.health(self._session_id)
-                    if h is not None:
-                        score = h.score
-                except Exception:
-                    pass
+            h = self._backend.health(self._session_id)
+            score = h.score if h is not None else None
             if score is None or score >= 75:
                 glyph = "[#4ade80]●[/]"
             elif score >= 50:
@@ -576,7 +560,7 @@ class AgentPanelView(Container):
         self._glyph_at = now
         return glyph
 
-    def _format_status_bar(self, status_data: dict) -> str:
+    def _format_status_bar(self, status_data: dict[str, Any]) -> str:
         parts: list[str] = []
         ctx = status_data.get("context_window", {})
         usage = ctx.get("current_usage") or {}
@@ -584,12 +568,7 @@ class AgentPanelView(Container):
         used = ctx.get("used_percentage")
         if used is not None:
             remaining = 100 - used
-            if remaining >= 70:
-                color = "green"
-            elif remaining >= 30:
-                color = "yellow"
-            else:
-                color = "red"
+            color = context_color(remaining)
             parts.append(f"[{color}]{remaining}% ctx[/{color}]")
 
         for key, label in (
@@ -604,11 +583,10 @@ class AgentPanelView(Container):
         return " | ".join(parts)
 
     async def _poll_loop(self) -> None:
-        from rich.text import Text
-
         output_widget = self.query_one(".agent-output", Static)
         scroll = self.query_one(".agent-scroll", VerticalScroll)
         status_widget = self.query_one(".agent-status", Static)
+        banner = self.query_one(".agent-prompt-banner", Static)
         while self._polling:
             try:
                 at_bottom = (
@@ -620,65 +598,55 @@ class AgentPanelView(Container):
                     self._follow_tail = False
                     self._update_pause_chip()
 
-                rich_content: Text | None = None
-                history: list[Text] = []
-                if hasattr(self._backend, "get_output_rich"):
-                    rich_content = await self._backend.get_output_rich(self._session_id)
-                    history = await self._backend.get_history_rich(self._session_id)
+                rich_content = await self._backend.get_output_rich(self._session_id)
+                history = await self._backend.get_history_rich(self._session_id)
 
                 if rich_content is not None:
-                    if history:
-                        combined = Text()
-                        for i, line in enumerate(history):
-                            if i > 0:
-                                combined.append("\n")
-                            combined.append_text(line)
-                        combined.append("\n")
-                        combined.append_text(rich_content)
-                        output_widget.update(_collapse_blank_runs(combined))
-                    else:
-                        output_widget.update(_collapse_blank_runs(rich_content))
+                    self._update_output(output_widget, rich_content, history)
                 else:
                     text = await self._backend.get_output(self._session_id)
                     if text:
                         output_widget.update(text)
 
-                status_data = None
-                if hasattr(self._backend, "status_data"):
-                    status_data = self._backend.status_data(self._session_id)
+                status_data = self._backend.status_data(self._session_id)
                 glyph = self._heartbeat_glyph()
                 if status_data:
                     bar = self._format_status_bar(status_data)
-                    status_widget.update(
-                        f"{glyph}  {bar}" if glyph else bar
-                    )
+                    status_widget.update(f"{glyph}  {bar}" if glyph else bar)
                 elif glyph:
                     status_widget.update(f"{glyph}  [dim]waiting for telemetry…[/]")
 
-                # Waiting-for-input banner
-                waiting = False
-                if hasattr(self._backend, "is_waiting_for_input"):
-                    try:
-                        waiting = bool(
-                            self._backend.is_waiting_for_input(self._session_id)
-                        )
-                    except Exception:
-                        waiting = False
-                try:
-                    self.query_one(".agent-prompt-banner", Static).display = waiting
-                except Exception:
-                    pass
+                banner.display = self._backend.is_waiting_for_input(self._session_id)
 
                 if self._follow_tail:
                     scroll.scroll_end(animate=False)
-            except Exception:
+            except Exception as e:
+                # Widgets are torn down out from under this loop on unmount, so
+                # ending here is correct — but it must not do so silently.
+                logger.debug("agent view poll stopped for %s: %s", self._session_id, e)
                 break
             await asyncio.sleep(0.2)
+
+    def _update_output(self, widget: Static, viewport: Text, history: list[Text]) -> None:
+        """Update the output widget, skipping the work when nothing changed.
+
+        Joining + collapsing several thousand history lines is the most expensive
+        thing this view does, and at 5Hz most ticks have identical content. The
+        backend hands back the *same* cached objects while the capture is
+        unchanged, so identity is a sound and free equality check — and holding
+        these references is what keeps that identity meaningful.
+        """
+        if viewport is self._last_viewport and history is self._last_history:
+            return
+        self._last_viewport = viewport
+        self._last_history = history
+        combined = Text("\n").join([*history, viewport]) if history else viewport
+        widget.update(_collapse_blank_runs(combined))
 
     @on(Input.Submitted, ".agent-input")
     async def handle_input(self, event: Input.Submitted) -> None:
         text = event.value.strip()
-        if text and hasattr(self._backend, "send_input"):
+        if text:
             await self._backend.send_input(self._session_id, text)
         event.input.value = ""
         self._input_mode = False
@@ -687,15 +655,13 @@ class AgentPanelView(Container):
 
 
 def _view_id(session_id: str) -> str:
-    """Convert a tmux session_id into a Textual-safe widget id."""
-    safe = "".join(c if (c.isalnum() or c == "-") else "_" for c in session_id)
-    return f"agent-view-{safe}"
+    """Widget id for an agent view. Stable across remounts."""
+    return f"agent-view-{sanitize_session_name(session_id)}"
 
 
 def agent_pane_id(session_id: str) -> str:
-    """Tab pane id derived from session_id; stable across remounts."""
-    safe = "".join(c if (c.isalnum() or c == "-") else "_" for c in session_id)
-    return f"tab-{safe}"
+    """Tab pane id derived from session_id. Stable across remounts."""
+    return f"tab-{sanitize_session_name(session_id)}"
 
 
 class DiffView(ModalScreen[None]):
@@ -738,8 +704,6 @@ class DiffView(ModalScreen[None]):
         )
 
     def compose(self) -> ComposeResult:
-        from rich.syntax import Syntax
-
         with Vertical(id="diff-view"):
             yield Static(self._summary(), id="diff-header")
             if self._diff:
@@ -758,7 +722,7 @@ class DiffView(ModalScreen[None]):
                     id="diff-scroll",
                 )
 
-    def _scroll(self):
+    def _scroll(self) -> VerticalScroll:
         return self.query_one("#diff-scroll", VerticalScroll)
 
     def action_scroll_down(self) -> None:

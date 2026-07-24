@@ -18,8 +18,9 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
-CLAUDE_SETTINGS: dict = {"permissions": {"defaultMode": "acceptEdits"}}
+CLAUDE_SETTINGS: dict[str, Any] = {"permissions": {"defaultMode": "acceptEdits"}}
 CLAUDE_IGNORE_LINE = ".claude/settings.local.json"
 DEFAULT_EXCLUDES_FILE = Path.home() / ".config" / "git" / "ignore"
 GLOBAL_CLAUDE_SETTINGS = Path.home() / ".claude" / "settings.json"

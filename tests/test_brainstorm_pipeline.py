@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from llm_cc.agents import STAGE_COMPLETE_MARKER
 from llm_cc.models import (
     AgentConfig,
     GlobalConfig,
@@ -19,8 +20,12 @@ from llm_cc.pipeline import PipelineEngine
 def _make_config(agents_list=None, max_loops=2):
     """Create a MergedConfig with a brainstorm planning stage."""
     agents = {
-        "strategist": AgentConfig(name="strategist", command="claude", args_template="--print {prompt}"),
-        "critic": AgentConfig(name="critic", command="claude", args_template="--print {prompt}"),
+        "strategist": AgentConfig(
+            name="strategist", command="claude", args_template="--print {prompt}"
+        ),
+        "critic": AgentConfig(
+            name="critic", command="claude", args_template="--print {prompt}"
+        ),
         "claude": AgentConfig(name="claude", command="claude"),
     }
     pipeline = [
@@ -312,14 +317,19 @@ def test_resume_prompt_execute(tmp_project):
     config = _make_same_agent_config()
     engine, _ = _make_engine(config, tmp_project)
 
-    task = Task(title="My Feature", status=TaskStatus.PLANNING, verify="tests pass", done="login works")
+    task = Task(
+        title="My Feature",
+        status=TaskStatus.PLANNING,
+        verify="tests pass",
+        done="login works",
+    )
     docs = tmp_project / ".llm-cc" / "tasks" / task.id
     docs.mkdir(parents=True, exist_ok=True)
 
     prompt = engine._build_resume_prompt(task, TaskStatus.EXECUTE, docs)
     assert "EXECUTE: My Feature" in prompt
     assert "Continue in the same session" in prompt
-    assert "EXECUTE COMPLETE" in prompt
+    assert STAGE_COMPLETE_MARKER in prompt
     assert "Verify: tests pass" in prompt
     assert "Done when: login works" in prompt
 
@@ -335,7 +345,7 @@ def test_resume_prompt_review(tmp_project):
 
     prompt = engine._build_resume_prompt(task, TaskStatus.REVIEW, docs)
     assert "REVIEW: My Feature" in prompt
-    assert "REVIEW COMPLETE" in prompt
+    assert STAGE_COMPLETE_MARKER in prompt
 
 
 async def test_advance_resumes_same_agent(tmp_project):

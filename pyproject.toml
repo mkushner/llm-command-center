@@ -44,6 +44,12 @@ select = ["E", "F", "I", "N", "W"]
 python_version = "3.12"
 strict = true
 
+# Optional extras — lazily imported and guarded at the call site, so they are
+# absent from the default dev environment.
+[[tool.mypy.overrides]]
+module = ["anthropic.*", "openai.*", "uvicorn.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]

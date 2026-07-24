@@ -1,4 +1,4 @@
-"""Tests for agent health monitoring: error detection, context monitoring, health scoring, sessions."""
+"""Agent health monitoring: error detection, context monitoring, scoring, sessions."""
 
 import json
 
@@ -152,18 +152,30 @@ def test_health_scorer_idle():
     assert h.responsiveness <= 5
 
 
+def _health(score: int, **parts: int) -> AgentHealth:
+    """AgentHealth with the component scores defaulted — only `score` drives
+    the color/label thresholds under test."""
+    return AgentHealth(
+        score=score,
+        liveness=parts.get("liveness", 0),
+        activity=parts.get("activity", 0),
+        stability=parts.get("stability", 0),
+        responsiveness=parts.get("responsiveness", 0),
+    )
+
+
 def test_health_color_thresholds():
     """Color and label properties at boundary values."""
-    assert AgentHealth(score=100, liveness=25, activity=25, stability=25, responsiveness=25).color == "green"
-    assert AgentHealth(score=75, liveness=25, activity=25, stability=25, responsiveness=0).color == "green"
-    assert AgentHealth(score=50, liveness=25, activity=25, stability=0, responsiveness=0).color == "yellow"
-    assert AgentHealth(score=25, liveness=25, activity=0, stability=0, responsiveness=0).color == "dark_orange"
-    assert AgentHealth(score=10, liveness=0, activity=0, stability=10, responsiveness=0).color == "red"
+    assert _health(100).color == "green"
+    assert _health(75).color == "green"
+    assert _health(50).color == "yellow"
+    assert _health(25).color == "dark_orange"
+    assert _health(10).color == "red"
 
-    assert AgentHealth(score=80, liveness=25, activity=25, stability=25, responsiveness=5).label == "healthy"
-    assert AgentHealth(score=50, liveness=25, activity=25, stability=0, responsiveness=0).label == "degraded"
-    assert AgentHealth(score=30, liveness=25, activity=5, stability=0, responsiveness=0).label == "unhealthy"
-    assert AgentHealth(score=10, liveness=0, activity=0, stability=10, responsiveness=0).label == "critical"
+    assert _health(80).label == "healthy"
+    assert _health(50).label == "degraded"
+    assert _health(30).label == "unhealthy"
+    assert _health(10).label == "critical"
 
 
 def test_health_context_color():

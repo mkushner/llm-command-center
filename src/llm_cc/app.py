@@ -15,7 +15,7 @@ from llm_cc.storage import Storage
 from llm_cc.ui.board import BoardScreen
 
 
-class CommandCenterApp(App):
+class CommandCenterApp(App[None]):
     """LLM Command Center — Multi-agent pipeline orchestration TUI."""
 
     CSS_PATH = "ui/styles.tcss"

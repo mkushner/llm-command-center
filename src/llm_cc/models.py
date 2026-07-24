@@ -98,18 +98,10 @@ class AgentConfig(BaseModel):
     mode: AgentMode = AgentMode.PTY
     api_provider: str | None = None
     api_model: str | None = None
-    resume_template: str | None = None
     co_author: str = ""
     detect_command: str | None = None
     allowed_tools: list[str] = []  # auto-approved tool patterns (e.g. Read, Bash(git:*))
     auto_full_auto: bool = False   # codex-only: inject --full-auto flag on spawn
-
-    @property
-    def display_label(self) -> str:
-        """Agent name + model for UI, e.g. 'claude opus-4.6'."""
-        if self.model:
-            return f"{self.name} {self.model}"
-        return self.name
 
 
 # --- Pipeline ---
@@ -122,7 +114,6 @@ class PipelineStage(BaseModel):
     max_loops: int = Field(default=1, ge=1, le=10)  # cycles through agents list
     summarizer: str = ""                  # agent that writes final summary after all loops
     mode_override: AgentMode | None = None
-    prompt_template: str | None = None
     cli_flags: str = ""  # extra CLI flags for this stage
     allowed_tools: list[str] = []   # additional auto-approved tools (merged with agent defaults)
     auto: bool = False  # auto-advance to next stage when agent reports completion
@@ -181,8 +172,11 @@ class ProjectConfig(BaseModel):
     stage_labels: dict[str, str] = {}
     plan_dir: str = ".llm-cc/tasks/{id}"  # template: {id}, {slug}, {branch}, {title}
     plan_file: str = "plan.md"  # constant filename within plan_dir
-    review_file: str | None = None  # optional: where review agent writes summary (resolved in plan_dir)
-    context_restart_threshold: int = 0  # auto-restart at this % remaining (0 = disabled, trust agent's internal compaction)
+    # optional: where the review agent writes its summary (resolved inside plan_dir)
+    review_file: str | None = None
+    # auto-restart at this % context remaining; 0 disables it and trusts the
+    # agent's own compaction instead
+    context_restart_threshold: int = 0
     auto_open_agent_tabs: bool = False  # if true, auto-open a tab for every active session
 
 

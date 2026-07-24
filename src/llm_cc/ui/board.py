@@ -11,9 +11,12 @@ from textual.containers import Horizontal, VerticalScroll
 from textual.events import Click
 from textual.message import Message
 from textual.screen import Screen
+from textual.timer import Timer
 from textual.widgets import Footer, Static, TabbedContent, TabPane
 
-from llm_cc.agents import AgentRegistry, TmuxBackend
+from llm_cc.agents import AgentRegistry
+from llm_cc.health import status_kind
+from llm_cc.log import logger
 from llm_cc.models import MergedConfig, PipelineStage, Task, TaskStatus
 from llm_cc.pipeline import PipelineEngine
 from llm_cc.storage import Storage
@@ -78,23 +81,31 @@ class TaskCard(Static, can_focus=False):
             and not self.task_data.session_id
         )
 
-    def _status_chip(self) -> tuple[str, str, str] | None:
-        """Resolve the single status chip for this card.
+    # Per status kind: (glyph, colour, label). `status_kind` in health.py resolves
+    # which one applies — the same ladder the web frontend uses.
+    _CHIPS = {
+        "error": ("⚠", "#f87171", "Error"),
+        "stale": ("●", "#f87171", "Needs restart"),
+        "ready": ("●", "#fb923c", "Ready"),
+        "waiting": ("●", "#fbbf24", "Waiting"),
+        "running": ("●", "#4ade80", "Running"),
+    }
 
-        Returns (glyph, color, label) or None for idle/no-status.
-        Priority: Error > Restart > Ready > Waiting > Running.
-        """
-        if self.top_error and self.task_data.session_id:
-            return ("⚠", "#f87171", f"Error: {self.top_error}")
-        if self.is_stale:
-            return ("●", "#f87171", "Needs restart")
-        if self.stage_complete:
-            return ("●", "#fb923c", "Ready")
-        if self.waiting_for_input:
-            return ("●", "#fbbf24", "Waiting")
-        if self.task_data.session_id:
-            return ("●", "#4ade80", "Running")
-        return None
+    def _status_chip(self) -> tuple[str, str, str] | None:
+        """Resolve the single status chip for this card, or None when idle."""
+        kind = status_kind(
+            has_session=bool(self.task_data.session_id),
+            in_active_stage=self.task_data.status in ACTIVE_STAGES,
+            top_error=self.top_error,
+            complete=self.stage_complete,
+            waiting=self.waiting_for_input,
+        )
+        if kind is None:
+            return None
+        glyph, color, label = self._CHIPS[kind]
+        if kind == "error":
+            label = f"Error: {self.top_error}"
+        return (glyph, color, label)
 
     def render(self) -> str:
         t = self.task_data
@@ -298,7 +309,7 @@ class KanbanColumn(VerticalScroll, can_focus=False):
             )
 
 
-class BoardScreen(Screen):
+class BoardScreen(Screen[None]):
     """Main screen: aggregate header, tabbed layout (overview + agent tabs)."""
 
     BINDINGS = [
@@ -328,8 +339,8 @@ class BoardScreen(Screen):
     def __init__(
         self,
         storage: Storage,
-        pipeline: PipelineEngine | None = None,
-        registry: AgentRegistry | None = None,
+        pipeline: PipelineEngine,
+        registry: AgentRegistry,
     ) -> None:
         super().__init__()
         self.storage = storage
@@ -339,7 +350,7 @@ class BoardScreen(Screen):
         self._visible_stages = self._config.active_stages()
         self._active_col: int = 0
         self._columns: list[KanbanColumn] = []
-        self._poll_timer = None
+        self._poll_timer: Timer | None = None
         self._context_restarted: set[str] = set()  # session_ids already auto-restarted
         self._inflight_tasks: set[str] = set()  # task_ids with a queued pipeline op
         self._open_tabs: dict[str, str] = {}  # session_id -> pane_id
@@ -396,8 +407,6 @@ class BoardScreen(Screen):
 
     def _poll_agent_status(self) -> None:
         """Check active agents: auto-advance brainstorm sub-agents, detect input waits."""
-        if not self.registry:
-            return
         changed = False
         for col in self._columns:
             for card in col.query(TaskCard):
@@ -412,44 +421,31 @@ class BoardScreen(Screen):
                 try:
                     agent_config = self._config.agent_for_stage(task.status, task)
                     backend = self.registry.backend_for(agent_config.name)
-                except Exception:
+                except KeyError:
                     continue
 
                 # Auto-advance brainstorm sub-agents when process exits or goes idle
-                if (
-                    self.pipeline
-                    and self.pipeline.is_brainstorm_stage(task)
-                ):
+                if self.pipeline.is_brainstorm_stage(task):
                     dead = not backend.is_alive(task.session_id)
-                    idle = isinstance(backend, TmuxBackend) and (
-                        backend.is_waiting_for_input(task.session_id)
-                        or backend.is_stage_complete(task.session_id)
-                    )
+                    idle = backend.is_waiting_for_input(
+                        task.session_id
+                    ) or backend.is_stage_complete(task.session_id)
                     if (dead or idle) and task.id not in self._inflight_tasks:
                         self._do_brainstorm_advance(task.id)
                         changed = True
                         continue
 
                 # Fetch health score
-                h = None
-                if hasattr(backend, "health"):
-                    h = backend.health(task.session_id)
-                    if h is not None:
-                        card.health_score = h.score
-                        card.health_color = h.color
-                        card.context_remaining = h.context_remaining
-                        card.context_color = h.context_color
-                        # Current context window token count
-                        token_sum = (h.input_tokens or 0) + (h.cache_creation_tokens or 0) + (h.cache_read_tokens or 0)
-                        card.total_tokens = token_sum if token_sum > 0 else None
-                        # Top error from recent errors
-                        if h.errors:
-                            worst = max(h.errors, key=lambda e: e.severity)
-                            card.top_error = worst.pattern_name
-                        else:
-                            card.top_error = None
-                        card.refresh()
-                        changed = True
+                h = backend.health(task.session_id)
+                if h is not None:
+                    card.health_score = h.score
+                    card.health_color = h.color
+                    card.context_remaining = h.context_remaining
+                    card.context_color = h.context_color
+                    card.total_tokens = h.context_tokens
+                    card.top_error = h.top_error
+                    card.refresh()
+                    changed = True
 
                 # Auto-restart on critical context pressure
                 if (
@@ -458,7 +454,6 @@ class BoardScreen(Screen):
                     and h.context_remaining is not None
                     and h.context_remaining <= self._config.project.context_restart_threshold
                     and task.session_id not in self._context_restarted
-                    and self.pipeline
                     and not self.pipeline.is_brainstorm_stage(task)
                 ):
                     self._context_restarted.add(task.session_id)
@@ -472,18 +467,14 @@ class BoardScreen(Screen):
                     continue
 
                 # Detect stage completion vs input waiting
-                if isinstance(backend, TmuxBackend):
-                    complete = backend.is_stage_complete(task.session_id)
-                    waiting = backend.is_waiting_for_input(task.session_id)
-                else:
-                    complete = False
-                    waiting = False
+                complete = backend.is_stage_complete(task.session_id)
+                waiting = backend.is_waiting_for_input(task.session_id)
                 if card.stage_complete != complete:
                     if complete:
                         # Auto-advance if stage.auto is enabled
                         stage_cfg = self._config.stage_config(task.status)
                         if (
-                            stage_cfg and stage_cfg.auto and self.pipeline
+                            stage_cfg and stage_cfg.auto
                             and task.id not in self._inflight_tasks
                         ):
                             self.app.notify(
@@ -511,9 +502,6 @@ class BoardScreen(Screen):
 
     def _sync_agent_tabs(self) -> None:
         """Open tabs for active agents; close tabs whose sessions ended."""
-        if not self.registry:
-            return
-
         store = self.storage.load_tasks()
         active_sessions: dict[str, Task] = {}
         for task in store.tasks:
@@ -732,14 +720,14 @@ class BoardScreen(Screen):
     # --- Helpers ---
 
     def _has_live_agent(self, task: Task) -> bool:
-        if not task.session_id or not self.registry:
+        if not task.session_id:
             return False
         try:
             agent_config = self._config.agent_for_stage(task.status, task)
             backend = self.registry.backend_for(agent_config.name)
-            return backend.is_alive(task.session_id)
-        except Exception:
+        except KeyError:
             return False
+        return backend.is_alive(task.session_id)
 
     # --- Task Operations ---
 
@@ -781,20 +769,7 @@ class BoardScreen(Screen):
         if task.status == TaskStatus.DONE:
             self.notify("Already at final stage", severity="warning")
             return
-        if self.pipeline:
-            self._do_advance(task.id)
-        else:
-            vs = self._visible_stages
-            idx = vs.index(task.status)
-            if idx >= len(vs) - 1:
-                return
-            next_status = vs[idx + 1]
-            task.status = next_status
-            task.touch()
-            self.storage.save_task(task)
-            self._refresh_board()
-            self._follow_task(task)
-            self.notify(f"Moved to {self._config.label_for(next_status)}: {task.title}")
+        self._do_advance(task.id)
 
     @work(exclusive=True, group="pipeline")
     async def _do_advance(self, task_id: str) -> None:
@@ -830,20 +805,7 @@ class BoardScreen(Screen):
         if task.status == TaskStatus.BACKLOG:
             self.notify("Already at first stage", severity="warning")
             return
-        if self.pipeline:
-            self._do_revert(task.id)
-        else:
-            vs = self._visible_stages
-            idx = vs.index(task.status)
-            if idx <= 0:
-                return
-            prev_status = vs[idx - 1]
-            task.status = prev_status
-            task.touch()
-            self.storage.save_task(task)
-            self._refresh_board()
-            self._follow_task(task)
-            self.notify(f"Back to {self._config.label_for(prev_status)}: {task.title}")
+        self._do_revert(task.id)
 
     @work(exclusive=True, group="pipeline")
     async def _do_revert(self, task_id: str) -> None:
@@ -870,8 +832,7 @@ class BoardScreen(Screen):
         if task.status not in ACTIVE_STAGES:
             self.notify("Nothing to restart in this stage", severity="warning")
             return
-        if self.pipeline:
-            self._do_restart(task.id)
+        self._do_restart(task.id)
 
     @work(exclusive=True, group="pipeline")
     async def _do_restart(self, task_id: str) -> None:
@@ -944,18 +905,18 @@ class BoardScreen(Screen):
         if not self._is_overview_active:
             return
         task = self._active_column.selected_task
-        if not task or not task.session_id or not self.registry:
+        if not task or not task.session_id:
             self.notify("No active agent session", severity="warning")
             return
         self._open_agent_tab(task)
 
     def _open_agent_tab(self, task: Task, focus: bool = True) -> None:
-        if not task.session_id or not self.registry:
+        if not task.session_id:
             return
         try:
             agent_config = self._config.agent_for_stage(task.status, task)
             backend = self.registry.backend_for(agent_config.name)
-        except Exception as e:
+        except KeyError as e:
             self.notify(f"Error resolving agent: {e}", severity="error")
             return
 
@@ -1024,8 +985,7 @@ class BoardScreen(Screen):
         if not task or not task.branch_name:
             self.notify("No branch for this task", severity="warning")
             return
-        if self.pipeline:
-            self._do_show_diff(task.id)
+        self._do_show_diff(task.id)
 
     @work(exclusive=True, group="diff")
     async def _do_show_diff(self, task_id: str) -> None:
@@ -1044,7 +1004,7 @@ class BoardScreen(Screen):
             return
         task_id = task.id
 
-        def on_confirm(confirmed: bool) -> None:
+        def on_confirm(confirmed: bool | None) -> None:
             if confirmed:
                 self._do_stop(task_id)
 
@@ -1061,7 +1021,7 @@ class BoardScreen(Screen):
                 self.notify("Task not found", severity="error")
                 return
             stopped_session = task.session_id
-            if task.session_id and self.registry:
+            if task.session_id:
                 agent_config = self._config.agent_for_stage(task.status, task)
                 backend = self.registry.backend_for(agent_config.name)
                 await backend.stop(task.session_id)
@@ -1084,7 +1044,7 @@ class BoardScreen(Screen):
         task_id = task.id
         task_title = task.title
 
-        def on_confirm(confirmed: bool) -> None:
+        def on_confirm(confirmed: bool | None) -> None:
             if confirmed:
                 self._do_delete(task_id, task_title)
 
@@ -1098,14 +1058,16 @@ class BoardScreen(Screen):
         try:
             task = self._fresh_task(task_id)
             stopped_session = None
-            if task and task.session_id and self.registry:
+            if task and task.session_id:
                 stopped_session = task.session_id
                 try:
                     agent_config = self._config.agent_for_stage(task.status, task)
                     backend = self.registry.backend_for(agent_config.name)
                     await backend.stop(task.session_id)
-                except Exception:
-                    pass
+                except (KeyError, OSError, RuntimeError) as e:
+                    # The task is being deleted regardless; a stuck session must
+                    # not block that.
+                    logger.warning("could not stop agent while deleting %s: %s", task_id, e)
             self.storage.delete_task(task_id)
             if stopped_session:
                 self._close_agent_tab(stopped_session)

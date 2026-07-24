@@ -10,15 +10,18 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..models import TaskStatus
+from ..health import status_kind
+from ..log import logger
+from ..models import AgentConfig, TaskStatus
 
 ACTIVE_STAGES = {TaskStatus.PLANNING, TaskStatus.EXECUTE, TaskStatus.REVIEW}
 _PREVIEW_LINES = 40
+_ATTENTION_KINDS = ("error", "waiting", "ready")
 
 
-def _model_label(ac: Any) -> str:
+def _model_label(ac: AgentConfig) -> str:
     """Model name with effort appended, e.g. 'claude-opus-4-8 / xhigh'."""
-    if ac.model and getattr(ac, "effort", None):
+    if ac.model and ac.effort:
         return f"{ac.model} / {ac.effort}"
     return ac.model or ""
 
@@ -51,12 +54,15 @@ async def build_state(app_state: Any) -> dict[str, Any]:
     stages: list[dict[str, Any]] = []
     for status in config.active_stages():
         entry = {"key": status.value, "label": config.label_for(status), "agent": "", "model": ""}
-        try:
-            ac = config.agent_for_stage(status)
-            entry["agent"] = ac.name
-            entry["model"] = _model_label(ac)
-        except Exception:
-            pass
+        # BACKLOG/DONE have no executor. agent_for_stage() can't say "none" — it
+        # falls back to the global default — so gate it here, as the TUI does.
+        if status in ACTIVE_STAGES:
+            try:
+                ac = config.agent_for_stage(status)
+                entry["agent"] = ac.name
+                entry["model"] = _model_label(ac)
+            except (KeyError, StopIteration) as e:
+                logger.debug("no agent resolved for stage %s: %s", status.value, e)
         stages.append(entry)
 
     return {
@@ -72,12 +78,13 @@ async def build_state(app_state: Any) -> dict[str, Any]:
 async def _task_dto(task: Any, registry: Any, config: Any) -> dict[str, Any]:
     sid = task.session_id
     agent = model = ""
-    try:
-        ac = config.agent_for_stage(task.status, task)
-        agent = ac.name
-        model = _model_label(ac)
-    except Exception:
-        pass
+    if task.status in ACTIVE_STAGES:
+        try:
+            ac = config.agent_for_stage(task.status, task)
+            agent = ac.name
+            model = _model_label(ac)
+        except (KeyError, StopIteration) as e:
+            logger.debug("no agent resolved for task %s: %s", task.id, e)
 
     dto: dict[str, Any] = {
         "id": task.id,
@@ -104,58 +111,44 @@ async def _task_dto(task: Any, registry: Any, config: Any) -> dict[str, Any]:
     if sid and agent:
         try:
             backend = registry.backend_for(agent)
-        except Exception:
-            backend = None
+        except KeyError as e:
+            logger.debug("no backend for agent %r on task %s: %s", agent, task.id, e)
 
     if sid and backend is not None:
+        # One guard for the whole backend block: this feeds a 1.5s websocket
+        # push, and a single unhealthy session must not take the board down.
         try:
-            if hasattr(backend, "health"):
-                h = backend.health(sid)
-                if h is not None:
-                    dto["health"] = h.score
-                    dto["health_color"] = h.color
-                    dto["context_remaining"] = h.context_remaining
-                    dto["context_color"] = h.context_color
-                    tok = (
-                        (h.input_tokens or 0)
-                        + (h.cache_creation_tokens or 0)
-                        + (h.cache_read_tokens or 0)
-                    )
-                    dto["tokens"] = tok or None
-                    if h.errors:
-                        worst = max(h.errors, key=lambda e: e.severity)
-                        dto["top_error"] = worst.pattern_name
-        except Exception:
-            pass
+            h = backend.health(sid)
+            if h is not None:
+                dto["health"] = h.score
+                dto["health_color"] = h.color
+                dto["context_remaining"] = h.context_remaining
+                dto["context_color"] = h.context_color
+                dto["tokens"] = h.context_tokens
+                dto["top_error"] = h.top_error
 
-        complete = waiting = False
-        try:
-            if hasattr(backend, "is_stage_complete"):
-                complete = backend.is_stage_complete(sid)
-            if hasattr(backend, "is_waiting_for_input"):
-                waiting = backend.is_waiting_for_input(sid)
-        except Exception:
-            pass
+            dto["status_kind"] = status_kind(
+                has_session=True,
+                in_active_stage=task.status in ACTIVE_STAGES,
+                top_error=dto["top_error"],
+                complete=backend.is_stage_complete(sid),
+                waiting=backend.is_waiting_for_input(sid),
+            )
 
-        if dto["top_error"]:
-            dto["status_kind"] = "error"
-        elif complete:
-            dto["status_kind"] = "ready"
-        elif waiting:
-            dto["status_kind"] = "waiting"
-        else:
-            dto["status_kind"] = "running"
+            out = await backend.get_output(sid)
+            if out:
+                dto["preview"] = "\n".join(out.splitlines()[-_PREVIEW_LINES:])
+        except Exception as e:
+            logger.warning("could not read backend state for task %s: %s", task.id, e)
+    elif not sid:
+        dto["status_kind"] = status_kind(
+            has_session=False,
+            in_active_stage=task.status in ACTIVE_STAGES,
+            top_error=None,
+            complete=False,
+            waiting=False,
+        )
+        dto["stale"] = dto["status_kind"] == "stale"
 
-        try:
-            if hasattr(backend, "get_output"):
-                out = await backend.get_output(sid)
-                if out:
-                    dto["preview"] = "\n".join(out.splitlines()[-_PREVIEW_LINES:])
-        except Exception:
-            pass
-    elif not sid and task.status in ACTIVE_STAGES:
-        dto["stale"] = True
-        dto["status_kind"] = "stale"
-
-    dto["attention"] = dto["status_kind"] in ("error", "waiting", "ready")
+    dto["attention"] = dto["status_kind"] in _ATTENTION_KINDS
     return dto
