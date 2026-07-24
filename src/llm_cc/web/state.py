@@ -29,7 +29,6 @@ async def build_state(app_state: Any) -> dict[str, Any]:
         dto = await _task_dto(task, registry, config)
         tasks.append(dto)
         if dto["session_id"]:
-            agg["running"] += 1
             if task.status == TaskStatus.EXECUTE:
                 agg["exec_active"] += 1
             kind = dto["status_kind"]
@@ -39,6 +38,8 @@ async def build_state(app_state: Any) -> dict[str, Any]:
                 agg["ready"] += 1
             elif kind == "waiting":
                 agg["waiting"] += 1
+            elif kind == "running":
+                agg["running"] += 1
 
     stages: list[dict[str, Any]] = []
     for status in config.active_stages():

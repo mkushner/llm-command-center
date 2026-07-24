@@ -1,3 +1,4 @@
+import type { CSSProperties } from "react";
 import { statusMeta } from "../helpers";
 import type { TaskDTO } from "../types";
 
@@ -23,7 +24,12 @@ export function Sidebar({ live, activeId, onPick, onNew }: Props) {
             .filter(Boolean)
             .join(" ");
           return (
-            <button className={cls} key={t.id} onClick={() => onPick(t.id)}>
+            <button
+              className={cls}
+              key={t.id}
+              style={{ "--ring": m.color } as CSSProperties}
+              onClick={() => onPick(t.id)}
+            >
               <span className="dot" style={{ background: m.color }} />
               <span className="st">
                 <span className="t">{t.title}</span>

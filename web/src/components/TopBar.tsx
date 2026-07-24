@@ -4,9 +4,9 @@ export function TopBar({ state }: { state: State | null }) {
   const agg = state?.aggregate;
   const pills: { c: string; t: string }[] = [];
   if (agg) {
-    if (agg.running) pills.push({ c: "var(--ok)", t: `${agg.running} running` });
-    if (agg.waiting) pills.push({ c: "var(--warn)", t: `${agg.waiting} waiting` });
-    if (agg.ready) pills.push({ c: "var(--orange)", t: `${agg.ready} ready` });
+    if (agg.running) pills.push({ c: "var(--warn)", t: `${agg.running} running` });
+    if (agg.waiting) pills.push({ c: "var(--orange)", t: `${agg.waiting} waiting` });
+    if (agg.ready) pills.push({ c: "var(--ok)", t: `${agg.ready} ready` });
     if (agg.error) pills.push({ c: "var(--err)", t: `${agg.error} error` });
   }
   return (

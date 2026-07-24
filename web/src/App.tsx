@@ -1,17 +1,16 @@
-import { Suspense, lazy, useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { connectBoard, del, getJSON, post, put } from "./api";
 import { byAttention } from "./helpers";
 import type { State, TaskDTO } from "./types";
 import { Board } from "./components/Board";
+import { ConfirmModal } from "./components/ConfirmModal";
 import { DiffModal } from "./components/DiffModal";
+import { Focus } from "./components/Focus";
 import { Grid } from "./components/Grid";
 import { Sidebar } from "./components/Sidebar";
 import { Tabs } from "./components/Tabs";
 import { TaskDialog } from "./components/TaskDialog";
 import { TopBar } from "./components/TopBar";
-
-// Lazy-loaded so the heavy xterm bundle only downloads when you drill into focus.
-const Focus = lazy(() => import("./components/Focus").then((m) => ({ default: m.Focus })));
 
 const BOARD = "board";
 
@@ -32,6 +31,13 @@ export default function App() {
   const [activeId, setActiveId] = useState<string | null>(null);
   const [dialog, setDialog] = useState<{ task?: TaskDTO } | null>(null);
   const [diff, setDiff] = useState<{ title: string; text: string } | null>(null);
+  const [confirm, setConfirm] = useState<{
+    prompt: string;
+    detail?: string;
+    confirmLabel?: string;
+    danger?: boolean;
+    onConfirm: () => void;
+  } | null>(null);
 
   useEffect(() => connectBoard(setState), []);
 
@@ -60,16 +66,36 @@ export default function App() {
   };
   const onView = (v: "grid" | "focus") => (v === "grid" ? toGrid() : toFocus());
 
-  const runAction = async (id: string, action: string) => {
-    if (action === "stop" && !window.confirm("Stop this agent?")) return;
-    const r = await post(`/api/task/${id}/${action}`);
-    if (r && r.error) window.alert(r.error);
+  const runAction = (id: string, action: string) => {
+    const doIt = async () => {
+      const r = await post(`/api/task/${id}/${action}`);
+      if (r && r.error) window.alert(r.error);
+    };
+    if (action === "stop") {
+      setConfirm({
+        prompt: "Stop this agent?",
+        detail: "The running tmux session will be killed.",
+        confirmLabel: "Stop",
+        danger: true,
+        onConfirm: () => void doIt(),
+      });
+      return;
+    }
+    void doIt();
   };
 
-  const deleteTask = async (task: TaskDTO) => {
-    if (!window.confirm(`Delete "${task.title}"?`)) return;
-    await del(`/api/task/${task.id}`);
-    if (activeId === task.id) toGrid();
+  const deleteTask = (task: TaskDTO) => {
+    setConfirm({
+      prompt: `Delete “${task.title}”?`,
+      detail: "This removes the task and stops its agent.",
+      confirmLabel: "Delete",
+      danger: true,
+      onConfirm: () =>
+        void (async () => {
+          await del(`/api/task/${task.id}`);
+          if (activeId === task.id) toGrid();
+        })(),
+    });
   };
 
   const saveTask = async (fields: Record<string, string>) => {
@@ -97,19 +123,20 @@ export default function App() {
         return;
       }
       if (e.key === "Escape") {
+        if (confirm) return setConfirm(null);
         if (dialog) return setDialog(null);
         if (diff) return setDiff(null);
         if (!isTypingTarget(e) && view === "focus" && activeId !== BOARD) toGrid();
         return;
       }
-      if (e.key === "o" && !dialog && !diff && !isTypingTarget(e)) {
+      if (e.key === "o" && !dialog && !diff && !confirm && !isTypingTarget(e)) {
         e.preventDefault();
         setDialog({});
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [view, activeId, dialog, diff, live]);
+  }, [view, activeId, dialog, diff, confirm, live]);
 
   let mode: "board" | "grid" | "focus";
   if (activeId === BOARD) mode = "board";
@@ -141,15 +168,23 @@ export default function App() {
           )}
           {mode === "grid" && <Grid live={live} onPick={drillTo} />}
           {mode === "focus" && activeFocusTask && (
-            <Suspense fallback={<div className="stage" />}>
-              <Focus task={activeFocusTask} onAction={runAction} onDiff={openDiff} onReply={sendReply} />
-            </Suspense>
+            <Focus task={activeFocusTask} onAction={runAction} onDiff={openDiff} onReply={sendReply} />
           )}
         </div>
       </div>
 
       {dialog && <TaskDialog task={dialog.task} onSave={saveTask} onClose={() => setDialog(null)} />}
       {diff && <DiffModal title={diff.title} text={diff.text} onClose={() => setDiff(null)} />}
+      {confirm && (
+        <ConfirmModal
+          prompt={confirm.prompt}
+          detail={confirm.detail}
+          confirmLabel={confirm.confirmLabel}
+          danger={confirm.danger}
+          onConfirm={confirm.onConfirm}
+          onClose={() => setConfirm(null)}
+        />
+      )}
     </div>
   );
 }

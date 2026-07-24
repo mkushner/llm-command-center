@@ -47,46 +47,59 @@ export function Terminal({ sessionId }: { sessionId: string }) {
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.open(host);
-    try {
-      fit.fit();
-    } catch {
-      /* host not measured yet */
-    }
 
-    const ws = new WebSocket(ptyUrl(sessionId, term.cols, term.rows));
-    ws.binaryType = "arraybuffer";
-    ws.onmessage = (ev) => {
-      if (typeof ev.data === "string") term.write(ev.data);
-      else term.write(new Uint8Array(ev.data));
-    };
-
-    const dataDisp = term.onData((d) => {
-      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ t: "i", d }));
-    });
+    let ws: WebSocket | undefined;
+    let ro: ResizeObserver | undefined;
+    let dataDisp: { dispose(): void } | undefined;
+    let cancelled = false;
 
     const sendResize = () => {
       try {
         fit.fit();
       } catch {
-        /* ignore */
+        /* container not measured yet */
       }
-      if (ws.readyState === WebSocket.OPEN) {
+      if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ t: "r", c: term.cols, r: term.rows }));
       }
     };
-    ws.onopen = () => {
-      sendResize();
-      term.focus();
-    };
 
-    const ro = new ResizeObserver(() => sendResize());
-    ro.observe(host);
+    // Attach only after the container has a real measured size — a fit() on a
+    // 0-sized host makes the PTY attach tiny and the screen render blank until
+    // a later resize. Two rAFs guarantees layout has settled.
+    const raf = requestAnimationFrame(() =>
+      requestAnimationFrame(() => {
+        if (cancelled) return;
+        try {
+          fit.fit();
+        } catch {
+          /* ignore */
+        }
+        ws = new WebSocket(ptyUrl(sessionId, term.cols || 120, term.rows || 32));
+        ws.binaryType = "arraybuffer";
+        ws.onmessage = (ev) => {
+          if (typeof ev.data === "string") term.write(ev.data);
+          else term.write(new Uint8Array(ev.data));
+        };
+        ws.onopen = () => {
+          sendResize();
+          term.focus();
+        };
+        dataDisp = term.onData((d) => {
+          if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ t: "i", d }));
+        });
+        ro = new ResizeObserver(() => sendResize());
+        ro.observe(host);
+      }),
+    );
 
     return () => {
-      ro.disconnect();
-      dataDisp.dispose();
+      cancelled = true;
+      cancelAnimationFrame(raf);
+      ro?.disconnect();
+      dataDisp?.dispose();
       try {
-        ws.close();
+        ws?.close();
       } catch {
         /* ignore */
       }

@@ -32,6 +32,11 @@ export function Grid({ live, onPick }: Props) {
                 <span className="dot" style={{ background: m.color }} />
                 <span className="ct">{t.title}</span>
                 <span className="cm">
+                  {t.status_kind && (
+                    <span className="cst" style={{ color: m.color }}>
+                      {m.label} ·{" "}
+                    </span>
+                  )}
                   {t.context_remaining != null ? `${t.context_remaining}% · ` : ""}
                   {t.agent} ↳
                 </span>

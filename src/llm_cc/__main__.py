@@ -81,6 +81,10 @@ def main() -> None:
     if "--web" in args:
         web = True
         args = [a for a in args if a != "--web"]
+    no_open = False
+    if "--no-open" in args:
+        no_open = True
+        args = [a for a in args if a != "--no-open"]
     for flag, setter in (("--host", "host"), ("--port", "port")):
         if flag in args:
             idx = args.index(flag)
@@ -169,7 +173,7 @@ def main() -> None:
     if web:
         from llm_cc.web.server import run_web
 
-        run_web(project_path, host=host, port=port)
+        run_web(project_path, host=host, port=port, open_browser=not no_open)
         return
 
     from llm_cc.app import CommandCenterApp

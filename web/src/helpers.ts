@@ -11,11 +11,11 @@ export function statusMeta(kind: string | null): StatusMeta {
     case "error":
       return { color: "var(--err)", label: "error", attn: true };
     case "waiting":
-      return { color: "var(--warn)", label: "waiting for input", attn: true };
+      return { color: "var(--orange)", label: "waiting for input", attn: true };
     case "ready":
-      return { color: "var(--orange)", label: "stage complete", attn: true };
+      return { color: "var(--ok)", label: "stage complete", attn: true };
     case "running":
-      return { color: "var(--ok)", label: "running", attn: false };
+      return { color: "var(--warn)", label: "running", attn: false };
     case "stale":
       return { color: "var(--faint)", label: "needs restart", attn: false };
     default:

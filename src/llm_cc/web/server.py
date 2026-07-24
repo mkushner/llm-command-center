@@ -294,15 +294,26 @@ def create_app(project_path: Path):
     return app
 
 
-def run_web(project_path: Path, host: str = "127.0.0.1", port: int = 7420) -> None:
+def run_web(
+    project_path: Path,
+    host: str = "127.0.0.1",
+    port: int = 7420,
+    open_browser: bool = True,
+) -> None:
     try:
         import uvicorn
     except ImportError:
         raise SystemExit("llm-cc --web needs the web extra. Install with:  uv sync --extra web")
     app = create_app(project_path)
-    if _find_dist():
-        where = "serving built UI"
-    else:
-        where = "API only — frontend not built (open the URL to build)"
-    print(f"llm-cc web → http://{host}:{port}  ({where})")
+    dist = _find_dist()
+    where = "serving built UI" if dist else "API only — frontend not built (open the URL to build)"
+    url_host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
+    url = f"http://{url_host}:{port}"
+    print(f"llm-cc web → {url}  ({where})")
+    if open_browser and dist is not None:
+        import threading
+        import webbrowser
+
+        # Open the default browser shortly after uvicorn is up.
+        threading.Timer(1.2, lambda: webbrowser.open(url)).start()
     uvicorn.run(app, host=host, port=port, log_level="warning")
