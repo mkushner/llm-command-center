@@ -168,7 +168,14 @@ class GitWorkspace:
                 check=False,
                 capture=True,
             )
-        # No local branch — try remote and create a local tracking branch.
+        # No local branch — fetch from origin (updates origin/<branch> to latest),
+        # then cut a local tracking branch for the worktree.
+        await async_run(
+            ["git", "fetch", "origin", branch],
+            cwd=self.project_path,
+            check=False,
+            timeout=120.0,
+        )
         remote = await async_run(
             ["git", "rev-parse", "--verify", f"refs/remotes/origin/{branch}"],
             cwd=self.project_path,
@@ -177,8 +184,8 @@ class GitWorkspace:
         )
         if remote.returncode != 0:
             raise RuntimeError(
-                f"checkout_branch '{branch}' not found locally or on origin. "
-                f"Fetch it first (git fetch origin {branch}) or create it."
+                f"branch '{branch}' not found locally or on origin "
+                f"(git fetch origin {branch} found nothing). Check the branch name."
             )
         return await async_run(
             ["git", "worktree", "add", str(wt_path), "-b", branch, f"origin/{branch}"],

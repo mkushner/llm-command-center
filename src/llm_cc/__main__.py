@@ -74,6 +74,30 @@ def main() -> None:
         clean_exit = True
         args = [a for a in args if a != "--clean-exit"]
 
+    # --web: run the browser frontend instead of the TUI (--host/--port optional)
+    web = False
+    host = "127.0.0.1"
+    port = 7420
+    if "--web" in args:
+        web = True
+        args = [a for a in args if a != "--web"]
+    for flag, setter in (("--host", "host"), ("--port", "port")):
+        if flag in args:
+            idx = args.index(flag)
+            if idx + 1 >= len(args):
+                print(f"Error: {flag} requires a value", file=sys.stderr)
+                sys.exit(1)
+            value = args[idx + 1]
+            if setter == "port":
+                try:
+                    port = int(value)
+                except ValueError:
+                    print("Error: --port must be a number", file=sys.stderr)
+                    sys.exit(1)
+            else:
+                host = value
+            args = args[:idx] + args[idx + 2:]
+
     # Determine project path: first positional arg or cwd
     if args and args[0] not in ("--help", "-h", "--version"):
         project_path = Path(args[0]).resolve()
@@ -87,14 +111,17 @@ def main() -> None:
         return
 
     if "--help" in args or "-h" in args:
-        print("Usage: llm-cc [project-path] [--tasks tasks.toml] [--clean-exit]")
-        print("  Launch the LLM Command Center TUI for the given project.")
+        print("Usage: llm-cc [project-path] [--tasks tasks.toml] [--clean-exit] [--web]")
+        print("  Launch the LLM Command Center for the given project.")
         print("  Defaults to current directory if no path given.")
         print("")
         print("Options:")
         print("  --tasks FILE  Import tasks from a TOML file into BACKLOG")
         print("  --clean-exit  Kill tmux agent sessions on shutdown")
         print("                (default: sessions persist for reattach)")
+        print("  --web         Run the browser UI instead of the terminal TUI")
+        print("  --host ADDR   Web bind address (default: 127.0.0.1)")
+        print("  --port N      Web port (default: 7420)")
         return
 
     # Ensure project path exists
@@ -136,9 +163,17 @@ def main() -> None:
                 print(f"Imported {count} task{'s' if count != 1 else ''} from .llm-cc/tasks.toml")
 
     from llm_cc.agents import set_clean_exit_mode
-    from llm_cc.app import CommandCenterApp
 
     set_clean_exit_mode(clean_exit)
+
+    if web:
+        from llm_cc.web.server import run_web
+
+        run_web(project_path, host=host, port=port)
+        return
+
+    from llm_cc.app import CommandCenterApp
+
     app = CommandCenterApp(project_path=project_path)
     app.run()
 

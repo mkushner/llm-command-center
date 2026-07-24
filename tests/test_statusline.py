@@ -274,22 +274,18 @@ async def test_status_data_public_method(tmp_path, patched_tmux):
 
 def test_statusline_script_setup(tmp_path):
     """Statusline script is written and global settings.local.json configured."""
-    from llm_cc.app import _STATUSLINE_SCRIPT, CommandCenterApp
+    from llm_cc.statusline import STATUSLINE_SCRIPT, setup_statusline
 
     fake_home = tmp_path / "home"
     fake_home.mkdir()
 
-    with patch.object(CommandCenterApp, "__init__", lambda self, *a, **kw: None), \
-         patch("pathlib.Path.home", return_value=fake_home):
-        app = CommandCenterApp.__new__(CommandCenterApp)
-        app.project_path = tmp_path
-
-        app._setup_statusline()
+    with patch("pathlib.Path.home", return_value=fake_home):
+        setup_statusline(tmp_path)
 
         # Script written to project
         script_path = tmp_path / ".llm-cc" / "bin" / "statusline.py"
         assert script_path.exists()
-        assert script_path.read_text() == _STATUSLINE_SCRIPT
+        assert script_path.read_text() == STATUSLINE_SCRIPT
         assert os.access(script_path, os.X_OK)
 
         # Settings written to global ~/.claude/
@@ -303,23 +299,19 @@ def test_statusline_script_setup(tmp_path):
 
 def test_statusline_settings_not_overwritten(tmp_path):
     """Non-llm-cc statusLine config is preserved."""
-    from llm_cc.app import CommandCenterApp
+    from llm_cc.statusline import setup_statusline
 
     fake_home = tmp_path / "home"
     fake_home.mkdir()
 
-    with patch.object(CommandCenterApp, "__init__", lambda self, *a, **kw: None), \
-         patch("pathlib.Path.home", return_value=fake_home):
-        app = CommandCenterApp.__new__(CommandCenterApp)
-        app.project_path = tmp_path
-
+    with patch("pathlib.Path.home", return_value=fake_home):
         # Pre-existing global settings with a custom (non-llm-cc) statusLine
         settings_path = fake_home / ".claude" / "settings.local.json"
         settings_path.parent.mkdir(parents=True, exist_ok=True)
         existing = {"statusLine": {"type": "command", "command": "my-custom-script"}}
         settings_path.write_text(json.dumps(existing))
 
-        app._setup_statusline()
+        setup_statusline(tmp_path)
 
         # Custom command should NOT be overwritten
         settings = json.loads(settings_path.read_text())
@@ -328,23 +320,19 @@ def test_statusline_settings_not_overwritten(tmp_path):
 
 def test_statusline_settings_updates_own_path(tmp_path):
     """Our own statusLine command is updated when script path changes."""
-    from llm_cc.app import CommandCenterApp
+    from llm_cc.statusline import setup_statusline
 
     fake_home = tmp_path / "home"
     fake_home.mkdir()
 
-    with patch.object(CommandCenterApp, "__init__", lambda self, *a, **kw: None), \
-         patch("pathlib.Path.home", return_value=fake_home):
-        app = CommandCenterApp.__new__(CommandCenterApp)
-        app.project_path = tmp_path
-
+    with patch("pathlib.Path.home", return_value=fake_home):
         # Existing settings pointing to an old llm-cc script path
         settings_path = fake_home / ".claude" / "settings.local.json"
         settings_path.parent.mkdir(parents=True, exist_ok=True)
         old = {"statusLine": {"type": "command", "command": "python3 /old/path/.llm-cc/bin/statusline.py"}}
         settings_path.write_text(json.dumps(old))
 
-        app._setup_statusline()
+        setup_statusline(tmp_path)
 
         # Should be updated to current path
         settings = json.loads(settings_path.read_text())

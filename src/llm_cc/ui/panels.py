@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from typing import TYPE_CHECKING
 
 from textual import on
 from textual.app import ComposeResult
@@ -14,6 +15,9 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Label, Static, TextArea
 
 from llm_cc.models import Task
+
+if TYPE_CHECKING:
+    from rich.text import Text
 
 
 class TaskInputDialog(ModalScreen[Task | None]):
@@ -47,6 +51,13 @@ class TaskInputDialog(ModalScreen[Task | None]):
                     id="task-title",
                 )
                 yield Static("", id="task-title-error", classes="form-error")
+
+                yield Label("Branch  [dim](optional — review/work on an existing branch)[/]")
+                yield Input(
+                    value=(self._editing.checkout_branch or "") if self._editing else "",
+                    placeholder="e.g. 'feature/oauth' — llm-cc fetches it into a worktree",
+                    id="task-branch",
+                )
 
                 yield Label("Spec  [dim](markdown supported)[/]")
                 yield TextArea(
@@ -114,12 +125,14 @@ class TaskInputDialog(ModalScreen[Task | None]):
         desc = self.query_one("#task-desc", TextArea).text.strip() or None
         verify = self.query_one("#task-verify", TextArea).text.strip() or None
         done = self.query_one("#task-done", TextArea).text.strip() or None
+        branch = self.query_one("#task-branch", Input).value.strip() or None
 
         if self._editing:
             self._editing.title = title
             self._editing.description = desc
             self._editing.verify = verify
             self._editing.done = done
+            self._editing.checkout_branch = branch
             self._editing.touch()
             self.dismiss(self._editing)
         else:
@@ -128,6 +141,7 @@ class TaskInputDialog(ModalScreen[Task | None]):
                 description=desc,
                 verify=verify,
                 done=done,
+                checkout_branch=branch,
             )
             self.dismiss(task)
 
@@ -254,6 +268,35 @@ class ConfirmDialog(ModalScreen[bool]):
         self.dismiss(False)
 
 
+# Alt-screen TUIs (e.g. claude) keep no tmux scrollback, so the only way to
+# retain history is to capture a frame taller than the visible widget and scroll
+# it here. This is that captured-frame height, independent of the widget size.
+_SCROLLBACK_ROWS = 500
+
+
+def _collapse_blank_runs(text: "Text", keep: int = 2) -> "Text":
+    """Collapse runs of more than `keep` blank lines down to `keep`.
+
+    A tall capture frame leaves a large blank gap between the top-anchored
+    transcript and the bottom-pinned input box (the agent pins its live UI to
+    the last row). Collapsing that gap keeps scrolling usable without dropping
+    any real output.
+    """
+    from rich.text import Text
+
+    out: list[Text] = []
+    blanks = 0
+    for line in text.split("\n"):
+        if line.plain.strip():
+            blanks = 0
+            out.append(line)
+        else:
+            blanks += 1
+            if blanks <= keep:
+                out.append(line)
+    return Text("\n").join(out)
+
+
 class AgentPanelView(Container):
     """Embedded live agent output viewer with raw key forwarding to PTY.
 
@@ -373,7 +416,9 @@ class AgentPanelView(Container):
         try:
             scroll = self.query_one(".agent-scroll", VerticalScroll)
             cols = scroll.size.width - 2
-            rows = scroll.size.height
+            # Height is decoupled from the widget: a tall pane is the only way to
+            # keep scrollback for alt-screen agents. The VerticalScroll scrolls it.
+            rows = max(scroll.size.height, _SCROLLBACK_ROWS)
             if cols > 0 and rows > 0 and hasattr(self._backend, "resize_session"):
                 self._backend.resize_session(self._session_id, cols, rows)
         except Exception:
@@ -590,9 +635,9 @@ class AgentPanelView(Container):
                             combined.append_text(line)
                         combined.append("\n")
                         combined.append_text(rich_content)
-                        output_widget.update(combined)
+                        output_widget.update(_collapse_blank_runs(combined))
                     else:
-                        output_widget.update(rich_content)
+                        output_widget.update(_collapse_blank_runs(rich_content))
                 else:
                     text = await self._backend.get_output(self._session_id)
                     if text:
