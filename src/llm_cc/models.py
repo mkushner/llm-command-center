@@ -33,6 +33,8 @@ class Task(BaseModel):
     branch_name: str | None = None
     # if set, worktree attaches to this existing branch instead of cutting one from base_branch
     checkout_branch: str | None = None
+    # skip git isolation entirely: run in the project root on whatever branch is checked out
+    one_off: bool = False
     pr_number: int | None = None
     pr_url: str | None = None
     docs_path: str | None = None  # .llm-cc/tasks/<id>/ — shared docs between stages

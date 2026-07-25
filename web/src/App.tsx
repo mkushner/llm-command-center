@@ -104,6 +104,14 @@ export default function App() {
     setDialog(null);
   };
 
+  // No dialog: a one-off has nothing to fill in. It starts an empty session in
+  // the project root and we drop straight into its terminal.
+  const startOneOff = async () => {
+    const r = await post("/api/one-off");
+    if (r && r.error) return window.alert(r.error);
+    if (r && r.id) drillTo(r.id);
+  };
+
   const openDiff = async (task: TaskDTO) => {
     const r = await getJSON(`/api/task/${task.id}/diff`);
     setDiff({ title: task.title, text: (r && r.diff) || "" });
@@ -142,7 +150,13 @@ export default function App() {
     <div className="app">
       <TopBar state={state} />
       <div className="body">
-        <Sidebar live={live} activeId={activeId} onPick={drillTo} onNew={() => setDialog({})} />
+        <Sidebar
+          live={live}
+          activeId={activeId}
+          onPick={drillTo}
+          onNew={() => setDialog({})}
+          onNewOneOff={() => void startOneOff()}
+        />
         <div className="main">
           <Tabs
             live={live}
@@ -168,7 +182,9 @@ export default function App() {
         </div>
       </div>
 
-      {dialog && <TaskDialog task={dialog.task} onSave={saveTask} onClose={() => setDialog(null)} />}
+      {dialog && (
+        <TaskDialog task={dialog.task} onSave={saveTask} onClose={() => setDialog(null)} />
+      )}
       {diff && <DiffModal title={diff.title} text={diff.text} onClose={() => setDiff(null)} />}
       {confirm && (
         <ConfirmModal

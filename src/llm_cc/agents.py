@@ -301,6 +301,65 @@ async def _tmux(*args: str) -> tuple[int, bytes, bytes]:
     return proc.returncode or 0, out, err
 
 
+def render_args(config: AgentConfig, prompt: str, task_id: str) -> str:
+    """Render an agent's args template.
+
+    An empty prompt means "just open the CLI" (one-off sessions): rendering the
+    template would hand the agent a literal empty argument instead.
+    """
+    if not prompt:
+        return ""
+    return config.args_template.format(
+        prompt=shlex.quote(prompt),
+        session_id=task_id,
+        model=config.model or "",
+    )
+
+
+def build_command(config: AgentConfig, prompt: str, task_id: str, cli_flags: str = "") -> str:
+    """Assemble the shell command that runs an agent with its prompt.
+
+    Argument order matters: `--allowedTools <tools...>` is variadic, so anything
+    positional following it is swallowed as another tool name. That is silent —
+    the CLI just opens with no prompt at all — so the flag has to stay *after*
+    the prompt. Keep any list-valued flag added here at the tail for the same
+    reason.
+    """
+    if not config.command:
+        raise ValueError(f"Agent '{config.name}' has no command configured for PTY mode")
+
+    # Inject --model if model is set and not already in args_template
+    model_flag = ""
+    if config.model and "{model}" not in config.args_template:
+        model_flag = f"--model {config.model}"
+    allowed_flag = ""
+    if config.allowed_tools and config.command == "claude":
+        allowed_flag = "--allowedTools " + shlex.quote(",".join(config.allowed_tools))
+    # Codex --full-auto: skip approval prompts inside isolated workspace.
+    # Skipped if the user has already specified an approval/sandbox flag.
+    full_auto_flag = ""
+    if (
+        config.auto_full_auto
+        and config.command == "codex"
+        and "--full-auto" not in cli_flags
+        and "--ask-for-approval" not in cli_flags
+        and " -a " not in f" {cli_flags} "
+        and "--sandbox" not in cli_flags
+        and " -s " not in f" {cli_flags} "
+        and "--dangerously-bypass-approvals-and-sandbox" not in cli_flags
+    ):
+        full_auto_flag = "--full-auto"
+    parts = [
+        config.command,
+        model_flag,
+        full_auto_flag,
+        cli_flags,
+        render_args(config, prompt, task_id),
+        allowed_flag,
+    ]
+    return " ".join(p for p in parts if p).strip()
+
+
 def _tmux_sync(*args: str) -> tuple[int, bytes]:
     """Blocking tmux call. Only for atexit cleanup and cold `is_alive` misses.
 
@@ -393,37 +452,7 @@ class TmuxBackend:
         if session_id in self._sessions:
             await self.stop(session_id)
 
-        if not config.command:
-            raise ValueError(f"Agent '{config.name}' has no command configured for PTY mode")
-
-        # Build command — inject --model if model is set and not in args_template
-        model_flag = ""
-        if config.model and "{model}" not in config.args_template:
-            model_flag = f"--model {config.model}"
-        allowed_flag = ""
-        if config.allowed_tools and config.command == "claude":
-            allowed_flag = "--allowedTools " + shlex.quote(",".join(config.allowed_tools))
-        # Codex --full-auto: skip approval prompts inside isolated workspace.
-        # Skipped if the user has already specified an approval/sandbox flag.
-        full_auto_flag = ""
-        if (
-            config.auto_full_auto
-            and config.command == "codex"
-            and "--full-auto" not in cli_flags
-            and "--ask-for-approval" not in cli_flags
-            and " -a " not in f" {cli_flags} "
-            and "--sandbox" not in cli_flags
-            and " -s " not in f" {cli_flags} "
-            and "--dangerously-bypass-approvals-and-sandbox" not in cli_flags
-        ):
-            full_auto_flag = "--full-auto"
-        cmd_args = config.args_template.format(
-            prompt=shlex.quote(prompt),
-            session_id=task.id,
-            model=config.model or "",
-        )
-        parts = [config.command, model_flag, allowed_flag, full_auto_flag, cli_flags, cmd_args]
-        full_cmd = " ".join(p for p in parts if p).strip()
+        full_cmd = build_command(config, prompt, task.id, cli_flags)
 
         # Log path — pipe-pane streams the pane's raw output here
         log_path = cwd / ".llm-cc" / "logs" / f"{session_id}.log"

@@ -14,6 +14,7 @@ export interface TaskDTO {
   agent: string;
   model: string;
   branch: string;
+  one_off: boolean; // runs in the project root, no worktree
   status_kind: string | null; // error | ready | waiting | running | stale | null
   health: number | null;
   health_color: string | null;

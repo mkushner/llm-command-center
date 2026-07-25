@@ -14,6 +14,7 @@ import contextlib
 import os
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
@@ -119,6 +120,25 @@ def create_app(project_path: Path) -> Starlette:
             checkout_branch=(body.get("checkout_branch") or None),
         )
         storage.save_task(task)
+        return JSONResponse({"ok": True, "id": task.id})
+
+    async def create_one_off(request: Request) -> Response:
+        """Create and immediately start a bare session in the project root.
+
+        No dialog and no backlog: a one-off carries no spec, so there is nothing
+        to fill in — it lands in EXECUTE with an empty prompt.
+        """
+        branch = await git.current_branch()
+        stamp = datetime.now().strftime("%H:%M")
+        task = Task(
+            title=f"one-off {stamp} · {branch}" if branch else f"one-off {stamp}",
+            one_off=True,
+        )
+        async with request.app.state.pipe_lock:
+            try:
+                await pipeline.start_one_off(task)
+            except Exception as e:
+                return JSONResponse({"error": str(e)}, status_code=500)
         return JSONResponse({"ok": True, "id": task.id})
 
     async def edit_task(request: Request) -> Response:
@@ -250,6 +270,7 @@ def create_app(project_path: Path) -> Starlette:
     routes = [
         Route("/api/state", state_endpoint),
         Route("/api/task", create_task, methods=["POST"]),
+        Route("/api/one-off", create_one_off, methods=["POST"]),
         Route("/api/task/{task_id}", edit_task, methods=["PUT"]),
         Route("/api/task/{task_id}", delete_task, methods=["DELETE"]),
         *[

@@ -73,20 +73,28 @@ class GitWorkspace:
         """Git operations only run if repo exists AND mode isn't NONE."""
         return self.config.mode != GitMode.NONE and self.is_git_repo()
 
+    async def current_branch(self) -> str:
+        """Branch checked out in the project root. Empty if detached or not a repo."""
+        if not self.is_git_repo():
+            return ""
+        result = await async_run(
+            ["git", "branch", "--show-current"],
+            cwd=self.project_path,
+            capture=True,
+            check=False,
+        )
+        return result.stdout.strip()
+
     async def setup(self, task: Task) -> Path:
-        """Create workspace for a task. Returns working directory path."""
-        if not self._git_enabled:
+        """Create workspace for a task. Returns working directory path.
+
+        One-off tasks opt out of isolation regardless of mode: they run in the
+        project root on whatever branch is already checked out.
+        """
+        if task.one_off or not self._git_enabled:
             # No git ops, but detect current branch for template resolution
-            if self.is_git_repo() and not task.branch_name:
-                result = await async_run(
-                    ["git", "branch", "--show-current"],
-                    cwd=self.project_path,
-                    capture=True,
-                    check=False,
-                )
-                branch = result.stdout.strip()
-                if branch:
-                    task.branch_name = branch
+            if not task.branch_name:
+                task.branch_name = await self.current_branch() or None
             return self.project_path
 
         if self.config.mode == GitMode.WORKTREE:

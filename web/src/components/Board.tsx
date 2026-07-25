@@ -71,6 +71,11 @@ function Card({ task, onOpen, onEdit, onDelete, onAction }: CardProps) {
         )}
         {!task.status_kind && task.status === "done" && <span style={{ color: "var(--ok)" }}>✓ done</span>}
         {!task.status_kind && task.status === "backlog" && <span className="c-faint">backlog</span>}
+        {task.one_off && (
+          <span className="c-faint" title="runs in the project root — no worktree">
+            one-off
+          </span>
+        )}
       </div>
       {live && (
         <div className="ctxrow">

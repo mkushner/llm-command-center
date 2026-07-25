@@ -7,9 +7,10 @@ interface Props {
   activeId: string | null;
   onPick: (id: string) => void;
   onNew: () => void;
+  onNewOneOff: () => void;
 }
 
-export function Sidebar({ live, activeId, onPick, onNew }: Props) {
+export function Sidebar({ live, activeId, onPick, onNew, onNewOneOff }: Props) {
   return (
     <div className="sidebar">
       <div className="side-head">
@@ -46,6 +47,13 @@ export function Sidebar({ live, activeId, onPick, onNew }: Props) {
       <div className="side-foot">
         <button className="newbtn" onClick={onNew}>
           ＋ new task
+        </button>
+        <button
+          className="newbtn"
+          onClick={onNewOneOff}
+          title="starts an empty agent session in the project root, on the current branch"
+        >
+          ＋ one-off task
         </button>
       </div>
     </div>

@@ -281,16 +281,25 @@ class PipelineEngine:
 
         return "\n".join(lines)
 
+    def _shares_root_checkout(self, task: Task) -> bool:
+        """True if this task works in the project root instead of its own worktree."""
+        return task.one_off or self.config.project.git.mode in (GitMode.NONE, GitMode.BRANCH)
+
     def _require_execute_slot(self, task: Task) -> None:
         """Guard the single EXECUTE slot when nothing isolates the working tree.
 
         Worktree mode gives every task its own directory, so concurrent execution
-        is fine there; NONE and BRANCH share one checkout and must not overlap.
+        is fine there; NONE, BRANCH and one-off tasks share one checkout and must
+        not overlap. Only root-sharing tasks contend for the slot.
         """
-        if self.config.project.git.mode not in (GitMode.NONE, GitMode.BRANCH):
+        if not self._shares_root_checkout(task):
             return
         store = self.storage.load_tasks()
-        occupied = [t for t in store.by_status(TaskStatus.EXECUTE) if t.id != task.id]
+        occupied = [
+            t
+            for t in store.by_status(TaskStatus.EXECUTE)
+            if t.id != task.id and self._shares_root_checkout(t)
+        ]
         if occupied:
             raise RuntimeError(f"Execute slot occupied by: {occupied[0].title}")
 
@@ -383,6 +392,33 @@ class PipelineEngine:
                     await self.git.cleanup(task)
 
         task.status = next_status
+        task.touch()
+        self.storage.save_task(task)
+        return task
+
+    async def start_one_off(self, task: Task) -> Task:
+        """Open a bare agent session in the project root, straight in EXECUTE.
+
+        A one-off has no spec, no plan and no task docs, so there is nothing for
+        a stage prompt to point at: the agent starts empty and the user drives it
+        from the terminal. BACKLOG and PLANNING are skipped entirely.
+        """
+        task.status = TaskStatus.EXECUTE
+        self._require_execute_slot(task)
+        await self.git.setup(task)  # no worktree — just records the checked-out branch
+        stage = self.config.stage_config(TaskStatus.EXECUTE)
+        agent_config = self._agent_config_for_stage(TaskStatus.EXECUTE, task)
+        backend = self.agents.backend_for(
+            agent_config.name, stage.mode_override if stage else None
+        )
+        task.session_id = await backend.start(
+            agent_config,
+            task,
+            "",
+            self._task_cwd(task),
+            stage=TaskStatus.EXECUTE.value,
+            cli_flags=stage.effective_cli_flags if stage else "",
+        )
         task.touch()
         self.storage.save_task(task)
         return task

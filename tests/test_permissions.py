@@ -227,8 +227,7 @@ def test_codex_default_config_has_auto_full_auto():
 def test_codex_full_auto_injected_in_command():
     """End-to-end check on command composition: --full-auto should be in argv
     for a codex agent with auto_full_auto=True."""
-    import shlex
-
+    from llm_cc.agents import build_command
     from llm_cc.models import AgentConfig
 
     config = AgentConfig(
@@ -237,20 +236,22 @@ def test_codex_full_auto_injected_in_command():
         args_template='"{prompt}"',
         auto_full_auto=True,
     )
-    cli_flags = ""
-    # Replicate the command-build logic from agents.py (keep in sync)
-    full_auto_flag = ""
-    if (
-        config.auto_full_auto
-        and config.command == "codex"
-        and "--full-auto" not in cli_flags
-        and "--ask-for-approval" not in cli_flags
-    ):
-        full_auto_flag = "--full-auto"
-    cmd_args = config.args_template.format(prompt=shlex.quote("hello"), session_id="x", model="")
-    parts = [config.command, "", "", full_auto_flag, cli_flags, cmd_args]
-    full_cmd = " ".join(p for p in parts if p).strip()
-    assert "--full-auto" in full_cmd
+    assert "--full-auto" in build_command(config, "hello", "x")
+
+
+def test_prompt_comes_before_allowed_tools():
+    """`--allowedTools <tools...>` is variadic: a positional prompt placed after
+    it is swallowed as another tool name and the agent opens with no prompt."""
+    from llm_cc.agents import build_command
+    from llm_cc.models import AgentConfig
+
+    config = AgentConfig(
+        name="claude", command="claude", model="claude-opus-5", allowed_tools=["Read", "Grep"]
+    )
+    cmd = build_command(config, "EXECUTE: ship it", "x")
+
+    assert "--allowedTools" in cmd
+    assert cmd.index("'EXECUTE: ship it'") < cmd.index("--allowedTools")
 
 
 def test_project_agent_override_inherits_default_allowed_tools(tmp_path):

@@ -95,6 +95,7 @@ async def _task_dto(task: Any, registry: Any, config: Any) -> dict[str, Any]:
         "agent": agent,
         "model": model,
         "branch": task.branch_name or task.checkout_branch or "",
+        "one_off": task.one_off,
         "status_kind": None,
         "health": None,
         "health_color": None,
