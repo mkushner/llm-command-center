@@ -204,6 +204,7 @@ context_restart_threshold = 0  # auto-restart agent at this % context remaining 
 mode = "worktree"
 base_branch = "main"
 branch_prefix = "task/"   # prefix for branch names; "" for flat naming
+extra_dirs = ["../sibling-repo"]  # dirs outside the worktree agents may edit without prompting
 
 # Define agents
 [agents.claude_opus]
@@ -508,6 +509,10 @@ Stage-to-stage transitions are manual. The WAITING FOR INPUT indicator tells you
 
 Tried it — Claude CLI shows an additional "I trust this project" acceptance prompt that requires interactive response. Auto-accepting trust prompts was fragile (cursor positioning issues, race conditions). Removed entirely. Agents use Claude CLI's normal interactive permission model. Users grant permissions via the agent panel.
 
+### Why worktrees list `additionalDirectories`
+
+Each worktree gets a `.claude/settings.local.json` with `defaultMode: acceptEdits`, but that only auto-approves edits *inside the workspace*. Task docs, plans and stage summaries live in the main checkout's `.llm-cc/` and prompts point worktree agents at them by absolute path — so without help, every one of those writes raises a one-file-at-a-time approval prompt. The main checkout is therefore always added to `permissions.additionalDirectories`, and `git.extra_dirs` adds any other repo a task legitimately spans. Changing `defaultMode` yourself in that file is respected; llm-cc only fills it in when absent.
+
 ---
 
 ## Data Models
@@ -608,6 +613,7 @@ class GitConfig(BaseModel):
     branch_prefix: str = "task/"         # prefix for branch names
     copy_files: list[str] = []           # files to copy into worktrees
     init_script: str | None = None       # script to run in new worktrees
+    extra_dirs: list[str] = []           # dirs outside the worktree agents may edit
 ```
 
 ### Config hierarchy

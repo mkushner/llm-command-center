@@ -160,6 +160,9 @@ class GitConfig(BaseModel):
     branch_prefix: str = "task/"  # prefix for branch names, e.g. "task/" → "task/a1b2-slug"
     copy_files: list[str] = []
     init_script: str | None = None
+    # dirs outside the worktree the agent may edit without prompting (e.g. a
+    # sibling repo). Absolute, ~-relative, or relative to the project root.
+    extra_dirs: list[str] = []
 
 
 # --- Project & Global Config ---

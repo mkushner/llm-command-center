@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 from .models import GitConfig, GitMode, Task
@@ -116,6 +117,7 @@ class GitWorkspace:
 
         # If worktree already exists and is valid, reuse it (preserves uncommitted work)
         if wt_path.exists() and (wt_path / ".git").exists():
+            write_claude_settings(wt_path, self._agent_extra_dirs())
             task.worktree_path = str(wt_path)
             task.branch_name = branch
             return wt_path
@@ -159,10 +161,33 @@ class GitWorkspace:
             raise RuntimeError(f"git worktree add failed: {stderr}")
 
         await self._init_workspace(wt_path)
-        write_claude_settings(wt_path)
+        write_claude_settings(wt_path, self._agent_extra_dirs())
         task.worktree_path = str(wt_path)
         task.branch_name = branch
         return wt_path
+
+    def _agent_extra_dirs(self) -> list[Path]:
+        """Dirs a worktree agent may touch besides its own worktree.
+
+        Always the project root — task docs, plan files and the summaries
+        stages exchange live in the main tree's `.llm-cc/`, and the prompts
+        point agents at them by absolute path. Plus anything in
+        `git.extra_dirs` (relative entries resolve against the project root).
+        """
+        # Both spellings of the project root: prompts hand agents paths built
+        # from it verbatim, and a symlinked path is a different string from its
+        # realpath to Claude's workspace check (e.g. /tmp vs /private/tmp).
+        dirs = [self.project_path, self.project_path.resolve()]
+        for entry in self.config.extra_dirs:
+            p = Path(entry).expanduser()
+            if not p.is_absolute():
+                p = self.project_path / p
+            p = p.resolve()
+            if p.is_dir():
+                dirs.append(p)
+            else:
+                print(f"llm-cc: git.extra_dirs entry is not a directory: {p}", file=sys.stderr)
+        return list(dict.fromkeys(dirs))
 
     async def _worktree_add_existing(self, wt_path: Path, branch: str) -> RunResult:
         """Attach a worktree to an existing branch (local or remote-tracking)."""

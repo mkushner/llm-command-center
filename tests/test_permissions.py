@@ -1,7 +1,7 @@
 """Tests for auto-permissions module.
 
 Covers:
-- `write_claude_settings` — writes file, idempotent (doesn't clobber existing).
+- `write_claude_settings` — writes file, records extra dirs, merges into existing.
 - `ensure_global_gitignore` — appends line, idempotent, works when excludesFile unset.
 - `ensure_global_claude_default_mode` — sets defaultMode, preserves other keys,
    respects stronger user choices, handles malformed JSON, idempotent.
@@ -45,14 +45,51 @@ def test_write_claude_settings_creates_file(tmp_path):
     assert data == {"permissions": {"defaultMode": "acceptEdits"}}
 
 
-def test_write_claude_settings_idempotent_does_not_clobber(tmp_path):
+def test_write_claude_settings_records_extra_dirs(tmp_path):
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    permissions.write_claude_settings(worktree, [tmp_path / "main", "/opt/sibling"])
+    data = json.loads((worktree / ".claude" / "settings.local.json").read_text())
+    assert data["permissions"]["additionalDirectories"] == [
+        str(tmp_path / "main"),
+        "/opt/sibling",
+    ]
+
+
+def test_write_claude_settings_merges_into_existing(tmp_path):
     worktree = tmp_path / "wt"
     (worktree / ".claude").mkdir(parents=True)
     existing = worktree / ".claude" / "settings.local.json"
-    existing.write_text('{"custom": true}')
+    existing.write_text(
+        '{"custom": true, "permissions": '
+        '{"defaultMode": "plan", "additionalDirectories": ["/opt/sibling"]}}'
+    )
+    permissions.write_claude_settings(worktree, ["/opt/sibling", "/opt/main"])
+    data = json.loads(existing.read_text())
+    assert data["custom"] is True
+    # User's stronger mode choice survives; dirs are unioned, not duplicated
+    assert data["permissions"]["defaultMode"] == "plan"
+    assert data["permissions"]["additionalDirectories"] == ["/opt/sibling", "/opt/main"]
+
+
+def test_write_claude_settings_no_rewrite_when_unchanged(tmp_path):
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    permissions.write_claude_settings(worktree, ["/opt/main"])
+    f = worktree / ".claude" / "settings.local.json"
+    mtime = f.stat().st_mtime_ns
+    permissions.write_claude_settings(worktree, ["/opt/main"])
+    assert f.stat().st_mtime_ns == mtime
+
+
+def test_write_claude_settings_skips_malformed_json(tmp_path, capsys):
+    worktree = tmp_path / "wt"
+    (worktree / ".claude").mkdir(parents=True)
+    existing = worktree / ".claude" / "settings.local.json"
+    existing.write_text("{not json")
     permissions.write_claude_settings(worktree)
-    # Original content preserved
-    assert json.loads(existing.read_text()) == {"custom": True}
+    assert existing.read_text() == "{not json"
+    assert "not valid JSON" in capsys.readouterr().err
 
 
 def test_write_claude_settings_swallows_errors(tmp_path, capsys):
